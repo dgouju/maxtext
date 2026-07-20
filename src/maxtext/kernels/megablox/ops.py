@@ -246,7 +246,7 @@ def _gmm_fwd(
     for axis in lhs_vma_axes:
       out = jax.lax.pcast(out, axis_name=axis, to="varying")
 
-  return out, (lhs, rhs, group_sizes, group_offset, partial_sum)
+  return out, (lhs, rhs, group_sizes, group_offset, partial_sum)  # pyrefly: ignore[bad-return]
 
 
 def _gmm_bwd(

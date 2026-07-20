@@ -825,7 +825,7 @@ def verify_and_sync_scan_layers(config):
       )
   else:
     max_logging.log(f"Setting scan_layers={saved_scan_layers} loaded from checkpoint metadata.")
-    new_pydantic_config = pydantic_config.model_copy(update={"scan_layers": saved_scan_layers})
+    new_pydantic_config = pydantic_config.model_copy(update={"scan_layers": saved_scan_layers})  # pyrefly: ignore[missing-attribute]
     # Wrap back in HyperParameters if the original config was wrapped
     if getattr(config, "_pydantic_config", None) is not None:
       config = pyconfig.HyperParameters(new_pydantic_config)

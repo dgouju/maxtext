@@ -1269,7 +1269,7 @@ def QWEN3_5_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=Fals
     hooks[f"{mlp_prefix}-shared_expert-wo-kernel"] = transpose
     hooks[f"{mlp_prefix}-shared_expert_gate-kernel"] = transpose
 
-    hooks[(f"{mlp_prefix}-routed_experts-wi_0", f"{mlp_prefix}-routed_experts-wi_1")] = (
+    hooks[(f"{mlp_prefix}-routed_experts-wi_0", f"{mlp_prefix}-routed_experts-wi_1")] = (  # pyrefly: ignore[unsupported-operation]
         process_wi_0_wi_1  # pyrefly: ignore[unsupported-operation]
     )
     hooks[f"{mlp_prefix}-routed_experts-wo"] = transpose_expert
@@ -1392,7 +1392,7 @@ def QWEN3_NEXT_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=F
       prefix = f"params-decoder-layers-layer_{block_idx}"
 
       # Layer norms
-      mapping[f"{prefix}-input_layernorm-scale"] = [
+      mapping[f"{prefix}-input_layernorm-scale"] = [  # pyrefly: ignore[bad-assignment]
           f"model.layers.{i}.input_layernorm.weight" for i in hf_indices
       ]  # pyrefly: ignore[bad-assignment]
       mapping[f"{prefix}-post_attention_layernorm-scale"] = [  # pyrefly: ignore[bad-assignment]
@@ -1953,7 +1953,7 @@ def GPT_OSS_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=False, savin
     hooks[f"{prefix}-GptOssMlp-gate-kernel"] = transpose
     # `composite_mt_key`: A hook for combining multiple MaxText params.
     hooks[(f"{prefix}-GptOssMlp-wi_0", f"{prefix}-GptOssMlp-wi_1")] = interleave  # pyrefly: ignore[unsupported-operation]
-    hooks[(f"{prefix}-GptOssMlp-wi_0_bias", f"{prefix}-GptOssMlp-wi_1_bias")] = (
+    hooks[(f"{prefix}-GptOssMlp-wi_0_bias", f"{prefix}-GptOssMlp-wi_1_bias")] = (  # pyrefly: ignore[unsupported-operation]
         interleave  # pyrefly: ignore[unsupported-operation]
     )
 
@@ -4010,7 +4010,7 @@ def DEEPSEEKV4_MAXTEXT_TO_HF_PARAM_MAPPING(config, maxtext_config, scan_layers=F
             }
         )
 
-    mapping.update(layer_map)
+    mapping.update(layer_map)  # pyrefly: ignore[no-matching-overload]
 
   if not scan_layers:
     for i in range(n_layers):
@@ -4039,7 +4039,7 @@ def DEEPSEEKV4_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=F
     return np.transpose(stacked, (0, 2, 1))  # [E, in, out]
 
   def ones_norm(input_tensor, target_shape=None):
-    return np.ones(target_shape, dtype=np.float32)
+    return np.ones(target_shape, dtype=np.float32)  # pyrefly: ignore[no-matching-overload]
 
   def identity(input_tensor, target_shape=None):
     return input_tensor
@@ -4061,9 +4061,9 @@ def DEEPSEEKV4_MAXTEXT_TO_HF_PARAM_HOOK_FN(config, maxtext_config, scan_layers=F
     # HF: [n_heads * v_head_dim, kv_lora_rank] (e.g. [8192, 4096])
     # MaxText: [n_heads, v_head_dim, kv_lora_rank] (e.g. [8, 4096, 1024])
     # We must reshape first and then permute (transpose) to get correct ordering.
-    num_heads = target_shape[0]
-    embed_dim = target_shape[1]
-    kv_lora_rank = target_shape[2]
+    num_heads = target_shape[0]  # pyrefly: ignore[unsupported-operation]
+    embed_dim = target_shape[1]  # pyrefly: ignore[unsupported-operation]
+    kv_lora_rank = target_shape[2]  # pyrefly: ignore[unsupported-operation]
     tensor = input_tensor.reshape((num_heads, kv_lora_rank, embed_dim))
     return np.transpose(tensor, (0, 2, 1))
 

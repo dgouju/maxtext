@@ -571,7 +571,7 @@ def sc_gather_reduce(
             if topk_wgt_zero_nan:
               row0 = arith.select(
                   arith.cmpf(
-                      arith.CmpFPredicate.OEQ, weights_vecs[0], zero_vec_f32
+                      arith.CmpFPredicate.OEQ, weights_vecs[0], zero_vec_f32  # pyrefly: ignore[unbound-name, unsupported-operation]
                   ),  # pyrefly: ignore[unbound-name, unsupported-operation]
                   zero_vec_f32,
                   row0,
@@ -583,7 +583,7 @@ def sc_gather_reduce(
             if topk_wgt_zero_nan:
               row8 = arith.select(
                   arith.cmpf(
-                      arith.CmpFPredicate.OEQ, weights_vecs[8], zero_vec_f32
+                      arith.CmpFPredicate.OEQ, weights_vecs[8], zero_vec_f32  # pyrefly: ignore[unsupported-operation]
                   ),  # pyrefly: ignore[unsupported-operation]
                   zero_vec_f32,
                   row8,

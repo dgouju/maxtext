@@ -173,7 +173,7 @@ def is_conversational(features, data_columns):
     messages = features[column]
     if isinstance(messages, datasets.Sequence):
       if (
-          isinstance(messages.feature, dict) and "role" in messages.feature and "content" in messages.feature
+          isinstance(messages.feature, dict) and "role" in messages.feature and "content" in messages.feature  # pyrefly: ignore[missing-attribute]
       ):  # pyrefly: ignore[missing-attribute]
         return True
 
@@ -843,17 +843,17 @@ class PadOrTrimToMaxLength(grain.MapTransform):
           raise TypeError("Only 'images' column can be of type PreprocessorOutput.")
 
         element[f"{data_column}_segmentation"] = (
-            element[data_column] != self.pad_id
+            element[data_column] != self.pad_id  # pyrefly: ignore[unsupported-operation]
         )  # pyrefly: ignore[unsupported-operation]
-        element[f"{data_column}_segmentation"] = element[f"{data_column}_segmentation"].astype(
+        element[f"{data_column}_segmentation"] = element[f"{data_column}_segmentation"].astype(  # pyrefly: ignore[missing-attribute]
             np.int32
         )  # pyrefly: ignore[missing-attribute]
         element[f"{data_column}_position"] = np.arange(
-            element[data_column].shape[0], dtype=np.int32
+            element[data_column].shape[0], dtype=np.int32  # pyrefly: ignore[missing-attribute]
         )  # pyrefly: ignore[missing-attribute]
         if self.add_true_length:
           element[f"{data_column}_true_length"] = np.array(
-              [element[data_column].shape[0]], dtype=np.int32
+              [element[data_column].shape[0]], dtype=np.int32  # pyrefly: ignore[missing-attribute]
           )  # pyrefly: ignore[missing-attribute]
 
     for key, _ in element.items():
