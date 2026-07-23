@@ -110,8 +110,19 @@ def find_nans_and_infs(pytree):
 
 
 def l2norm_pytree(x):
-  """L2 norm of a pytree of arrays."""
-  return jnp.sqrt(jax.tree_util.tree_reduce(lambda x, y: x + jnp.sum(jnp.square(y)), x, initializer=0.0))
+  """L2 norm of a pytree of arrays.
+
+  Handles QArray / QLoRA quantized weight leaves by unwrapping qvalue and
+  safely skipping non-numeric or structured void dtypes (dtype.kind 'V').
+  """
+
+  def leaf_sq_sum(y):
+    y = getattr(y, "qvalue", y)
+    if hasattr(y, "dtype") and y.dtype.kind in "fiuc":
+      return jnp.sum(jnp.square(y))
+    return 0.0
+
+  return jnp.sqrt(jax.tree_util.tree_reduce(lambda acc, y: acc + leaf_sq_sum(y), x, initializer=0.0))
 
 
 def calculate_num_params_from_pytree(params):

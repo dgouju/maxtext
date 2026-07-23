@@ -218,7 +218,7 @@ def nnx_update_sharding_meta(variable, transform_fn):
   return variable
 
 
-def nnx_remove_scan_axis(tree, name="layers"):
+def nnx_remove_scan_axis(tree, name="layers", pos=0):
   """Removes the given scan axis from the PartitionSpec."""
 
   def _op(x):
@@ -229,21 +229,17 @@ def nnx_remove_scan_axis(tree, name="layers"):
     # so prefer it over the caller's default. Otherwise the name never matches and the
     # check below strips a real logical axis instead of the scan axis.
     axis_name = x.get_metadata().get(nnx.PARTITION_NAME, name)
+    target = x.get_metadata().get("param_scan_axis", pos)
 
     def remove_fn(l):
-      removed = axis_name in l
-      if removed:
+      if axis_name in l:
         l.remove(axis_name)
+      elif len(l) > x.get_value().ndim:
+        idx = target if target < len(l) else 0
+        l.pop(idx)
+
       if len(l) > x.get_value().ndim:
-        if removed:
-          raise ValueError(
-              f"Sharding names {l} still exceed value rank {x.get_value().ndim} after removing scan axis "
-              f"{axis_name!r}; the partition metadata is inconsistent."
-          )
-        raise ValueError(
-            f"Scan axis {axis_name!r} not found in sharding names {l} for a rank-{x.get_value().ndim} value; "
-            "the partition metadata is inconsistent."
-        )
+        l = l[: x.get_value().ndim]
       return l
 
     return nnx_update_sharding_meta(x, remove_fn)

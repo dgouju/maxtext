@@ -179,7 +179,9 @@ def get_tunix_config(mt_config):
   return peft_trainer.TrainingConfig(
       eval_every_n_steps=mt_config.eval_interval,
       max_steps=mt_config.steps,
-      gradient_accumulation_steps=mt_config.gradient_accumulation_steps,
+      gradient_accumulation_steps=(
+          mt_config.gradient_accumulation_steps if mt_config.gradient_accumulation_steps > 1 else None
+      ),
       checkpoint_root_directory=mt_config.checkpoint_dir,
       checkpointing_options=checkpointing_options,
       metrics_logging_options=metrics_logging_options,

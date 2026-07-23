@@ -21,7 +21,7 @@ import os
 import re
 from typing import Optional
 
-from flax import nnx, linen as nn
+from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 import jax
@@ -35,6 +35,7 @@ from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
+from maxtext.utils import sharding
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR
 
 # NNX-only imports (train_state_nnx, model_creation_utils) are loaded lazily
@@ -433,10 +434,10 @@ def _get_lora_module_path(mt_config: pyconfig.HyperParameters) -> str:
 
   raw_path = lora_configs.get(matched_key, "decoder/layers/.*(self_attention/(query|key|value|out)|mlp/(wi_0|wi_1|wo))")
 
-  # This regex makes the layer index optional, matching scanned, unscanned named (layers_0),
-  # and unscanned index (layers/0) layer paths.
-  layer_pattern = r"layers(?:_[0-9]+|/[0-9]+)?/"
-  final_path = str(raw_path).replace("layers/", layer_pattern)
+  # This regex makes the layer index optional, matching both scanned and unscanned layer paths
+  # (e.g. 'layers/0/mlp/...' vs 'layers/mlp/...').
+  optional_layer_index = "(?:[0-9]+/)?"
+  final_path = str(raw_path).replace("layers/", f"layers/{optional_layer_index}")
 
   max_logging.log(f"Using lora_module_path: {final_path}")
   return final_path
@@ -485,8 +486,7 @@ def is_lora_enabled(model: nnx.Module) -> bool:
 def _verify_lora_parameters(lora_model: nnx.Module, mt_config: pyconfig.HyperParameters) -> None:
   """Validates that LoRA is active or that target modules were matched."""
 
-  enabled = is_lora_enabled(lora_model)
-  if enabled:
+  if is_lora_enabled(lora_model):
     wrapped_modules = set()
     for path, value in nnx.iter_graph(lora_model):
       if isinstance(value, nnx.LoRAParam):
@@ -580,7 +580,6 @@ def apply_lora_to_model(
     mt_config: pyconfig.HyperParameters,
 ) -> nnx.Module:
   """Optionally applies LoRA/QLoRA to a MaxText model using Qwix."""
-  # pylint: disable=protected-access
   # Skip Qwix LoRA if MaxText LoRA adapters are loaded
   if mt_config.lora_input_adapters_path:
     max_logging.log("MaxText LoRA adapters loaded, skipping Qwix LoRA application")
@@ -609,41 +608,99 @@ def apply_lora_to_model(
   )
 
   if mesh is not None:
-    with jax.set_mesh(mesh), nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+
+    def _apply_sharding():
+      nonlocal lora_model
       graph_def, state = nnx.split(lora_model)
 
-      # We handle explicit replication for LoRA to ensure safety and efficiency.
+      # Get partition spec from state while logical axis names are intact
+      pspecs = sharding.logical_to_mesh(nnx.get_partition_spec(state), mesh, mt_config.logical_axis_rules)
+      dst_shardings = jax.tree.map(lambda ps: jax.sharding.NamedSharding(mesh, ps) if ps is not None else None, pspecs)
+
+      def _replace_sharding(x):
+        if isinstance(x, nnx.Variable) and hasattr(x, "sharding"):
+          return x.replace(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
+        return x
+
       state = jax.tree_util.tree_map(
-          lambda x: x.replace(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
-          if isinstance(x, nnx.LoRAParam)
-          else x,
+          _replace_sharding,
           state,
           is_leaf=lambda x: isinstance(x, nnx.Variable),
       )
 
-      # Use logical_to_mesh_sharding to correctly map logical axes like 'embed'
-      # to physical mesh axes.
-      dst_shardings = nn.logical_to_mesh_sharding(nnx.get_partition_spec(state), mesh, mt_config.logical_axis_rules)
+      default_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
       def _safe_reshard(var, sharding_spec):
-        if not isinstance(var, nnx.Variable) or not isinstance(sharding_spec, jax.sharding.Sharding):
+        if not isinstance(var, nnx.Variable):
           return var
         val = var.get_value()
         if not isinstance(val, jax.Array):
           return var
-        # make_array_from_callback natively constructs a globally sharded array
-        # from the local host arrays, bypassing backend-specific device_put issues
-        # on both Pathways and McJAX.
-        resharded_val = jax.make_array_from_callback(val.shape, sharding_spec, lambda idx: val[idx])
-        return var.replace(value=resharded_val)
+        target_sharding = sharding_spec if isinstance(sharding_spec, jax.sharding.Sharding) else default_sharding
+        if isinstance(val, jax.core.Tracer):
+          resharded_val = jax.lax.with_sharding_constraint(val, target_sharding)
+          return var.replace(value=resharded_val, sharding=target_sharding)
+        try:
+          resharded_val = jax.make_array_from_callback(val.shape, target_sharding, lambda idx: val[idx])
+          return var.replace(value=resharded_val, sharding=target_sharding)
+        except Exception:  # pylint: disable=broad-exception-caught
+          resharded_val = jax.lax.with_sharding_constraint(val, target_sharding)
+          return var.replace(value=resharded_val, sharding=target_sharding)
 
       state = jax.tree_util.tree_map(_safe_reshard, state, dst_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable))
 
       lora_model = nnx.merge(graph_def, state)
+      _reconstruct_qwix_containers(lora_model)
+
+    try:
+      with jax.set_mesh(mesh), nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+        _apply_sharding()
+    except ValueError:
+      with nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+        _apply_sharding()
 
   _verify_lora_parameters(lora_model, mt_config)
 
   return lora_model
+
+
+def _reconstruct_qwix_containers(model: nnx.Module) -> None:
+  """Reconstructs Qwix QArray / WithAux objects if nnx.split/merge converted them to States."""
+  from qwix._src.providers.ptq import WithAux  # pylint: disable=import-outside-toplevel
+
+  for _, module in model.iter_modules():
+    if not hasattr(module, "kernel"):
+      continue
+    k_val = getattr(module.kernel, "value", module.kernel)
+    if not isinstance(k_val, (nnx.State, dict)) or isinstance(k_val, jax.Array):
+      continue
+
+    sub_dict = k_val.get("array", k_val) if hasattr(k_val, "get") else getattr(k_val, "array", k_val)
+    if not (hasattr(sub_dict, "get") or hasattr(sub_dict, "qvalue")):
+      continue
+
+    qval = sub_dict.get("qvalue", None) if hasattr(sub_dict, "get") else getattr(sub_dict, "qvalue", None)
+    if qval is None:
+      continue
+
+    if isinstance(qval, nnx.Variable):
+      qval = qval.get_value()
+    sval = sub_dict.get("scale", None) if hasattr(sub_dict, "get") else getattr(sub_dict, "scale", None)
+    if isinstance(sval, nnx.Variable):
+      sval = sval.get_value()
+    zp = sub_dict.get("zero_point", None) if hasattr(sub_dict, "get") else getattr(sub_dict, "zero_point", None)
+    if isinstance(zp, nnx.Variable):
+      zp = zp.get_value()
+
+    qarr = qwix.QArray(qvalue=qval, scale=sval, zero_point=zp)
+    how = k_val.get("how", None) if hasattr(k_val, "get") else getattr(k_val, "how", None)
+    if how is not None:
+      qarr = WithAux(array=qarr, how=how)
+
+    if isinstance(module.kernel, nnx.Variable):
+      module.kernel.value = qarr
+    else:
+      module.kernel = qarr
 
 
 def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameters) -> nnx.Module:
@@ -684,7 +741,11 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
       is_leaf=lambda n: isinstance(n, nnx.Variable),
   )
 
-  sharding_tree = jax.tree.map(lambda x: x.sharding if hasattr(x, "sharding") else None, target_for_restore)
+  sharding_tree = jax.tree.map(
+      lambda v: {"value": getattr(v, "sharding", None)},
+      abstract_lora_params,
+      is_leaf=lambda n: isinstance(n, nnx.Variable),
+  )
   restore_args_tree = ocp.checkpoint_utils.construct_restore_args(target_for_restore, sharding_tree)
 
   try:
@@ -733,6 +794,35 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
   )
 
   nnx.update(model, abstract_lora_params)
+
+  mesh = getattr(model, "mesh", None)
+  if mesh is not None:
+    _, state = nnx.split(model)
+    pspecs = sharding.logical_to_mesh(nnx.get_partition_spec(state), mesh, mt_config.logical_axis_rules)
+    dst_shardings = jax.tree.map(lambda ps: jax.sharding.NamedSharding(mesh, ps) if ps is not None else None, pspecs)
+
+    default_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def _safe_reshard(var, sharding_spec):
+      if not isinstance(var, nnx.Variable):
+        return var
+      val = var.get_value()
+      if not isinstance(val, jax.Array):
+        return var
+      target_sharding = sharding_spec if isinstance(sharding_spec, jax.sharding.Sharding) else default_sharding
+      if isinstance(val, jax.core.Tracer):
+        resharded_val = jax.lax.with_sharding_constraint(val, target_sharding)
+        return var.replace(value=resharded_val, sharding=target_sharding)
+      try:
+        resharded_val = jax.make_array_from_callback(val.shape, target_sharding, lambda idx: val[idx])
+        return var.replace(value=resharded_val, sharding=target_sharding)
+      except Exception:  # pylint: disable=broad-exception-caught
+        resharded_val = jax.lax.with_sharding_constraint(val, target_sharding)
+        return var.replace(value=resharded_val, sharding=target_sharding)
+
+    state = jax.tree_util.tree_map(_safe_reshard, state, dst_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable))
+    nnx.update(model, state)
+
   max_logging.log(f"LoRA restore complete from '{lora_restore_path}'.")
   return model
 
