@@ -460,6 +460,13 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
 
   fixed = jax.tree_util.tree_map_with_path(_fix_one, restore_args, is_leaf=lambda x: isinstance(x, ocp.ArrayRestoreArgs))
 
+  missing_count = len(missing_paths)
+  if missing_count > 0:
+    import logging
+    sample = "\\n".join(missing_paths[:20])
+    more = f"\\n  ... and {missing_count - 20} more" if missing_count > 20 else ""
+    logging.error(f"FOUND {missing_count} MISSING PATHS IN _fix_one:\\n{sample}{more}")
+
   if rank_mismatched_paths:
     sample = "\n".join(rank_mismatched_paths[:5])
     more = f"\n  ... and {len(rank_mismatched_paths) - 5} more" if len(rank_mismatched_paths) > 5 else ""
@@ -992,11 +999,28 @@ def from_pretrained(
       ):
         # structure of linen checkpoint: {'params': {'params': {'decoder': ...}}}
         is_nnx_checkpoint = False
+
+        def _morph_unscanned_tree(target, meta_tree):
+          if not hasattr(target, "items") or not hasattr(meta_tree, "items"):
+            return target
+          new_target = {}
+          for k, v in target.items():
+            if k == "layers" and k not in meta_tree:
+              for idx, sub_v in v.items():
+                new_key = f"layers_{idx}"
+                if new_key in meta_tree:
+                  new_target[new_key] = _morph_unscanned_tree(sub_v, meta_tree.get(new_key, {}))
+            else:
+              new_target[k] = _morph_unscanned_tree(v, meta_tree.get(k, {}))
+          return new_target
+
         target_for_restore = jax.tree.map(
             lambda v: v[...],
             param_state,
             is_leaf=lambda n: isinstance(n, nnx.Variable),
         )
+
+        target_for_restore = _morph_unscanned_tree(target_for_restore, metadata.item_metadata.tree["params"]["params"])
 
         target_for_restore = _adjust_target_for_moe_fusion(
             target_for_restore, metadata.item_metadata.tree["params"]["params"], False
@@ -1102,6 +1126,22 @@ def from_pretrained(
         )
       else:
         checkpoint = restored["params"]["params"]
+        
+        def _unmorph_unscanned_tree(target):
+          if not hasattr(target, "items"):
+            return target
+          new_target = {}
+          layers_dict = {}
+          for k, v in target.items():
+            if isinstance(k, str) and k.startswith("layers_") and k[7:].isdigit():
+              layers_dict[k[7:]] = _unmorph_unscanned_tree(v)
+            else:
+              new_target[k] = _unmorph_unscanned_tree(v)
+          if layers_dict:
+            new_target["layers"] = layers_dict
+          return new_target
+          
+        checkpoint = _unmorph_unscanned_tree(checkpoint)
 
       if checkpoint:
         # Same QTensor caveat as `_build_value_target` / `_free_device_memory`:
@@ -1146,7 +1186,15 @@ def from_pretrained(
           """Recursively keep only keys present in model, dropping checkpoint-only fields (e.g. to_nnx__rngs)."""
           if not hasattr(ckpt, "items") or not hasattr(model, "items"):
             return ckpt
-          return {k: _filter_to_model_keys(ckpt[k], model[k]) for k in model if k in ckpt}
+          res = {}
+          for k in model:
+            if k in ckpt:
+              res[k] = _filter_to_model_keys(ckpt[k], model[k])
+            elif str(k) in ckpt:
+              res[k] = _filter_to_model_keys(ckpt[str(k)], model[k])
+            elif isinstance(k, str) and k.isdigit() and int(k) in ckpt:
+              res[k] = _filter_to_model_keys(ckpt[int(k)], model[k])
+          return res
 
         checkpoint = _filter_to_model_keys(checkpoint, model_arrays)
 
@@ -1169,6 +1217,13 @@ def from_pretrained(
           return _align_checkpoint_to_model_shapes(ckpt, model_arr, axes)
 
         checkpoint = _walk_align(checkpoint, model_arrays, logical_axes_tree)
+        
+        def _check_not_deleted(node):
+          if isinstance(node, jax.Array) and node.is_deleted():
+            raise RuntimeError("FOUND DELETED ARRAY BEFORE NNX UPDATE")
+          return node
+        jax.tree_util.tree_map(_check_not_deleted, checkpoint)
+        
         nnx.update(model, checkpoint)
       else:
         raise ValueError(
