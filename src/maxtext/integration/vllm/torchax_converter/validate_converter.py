@@ -277,7 +277,7 @@ def validate_converter(argv) -> None:
   model, mesh = model_creation_utils.from_pretrained(
       trainer_config,
       devices=trainer_devices,
-      model_mode=MODEL_MODE_AUTOREGRESSIVE,
+      model_mode=MODEL_MODE_TRAIN,
   )
   print(f"{GREEN}MaxText model loaded successfully{RESET}")
   print(f"Model: {trainer_config.model_name}")
@@ -319,6 +319,7 @@ def validate_converter(argv) -> None:
     print("\n" + "=" * 80)
     print("Computing MaxText Golden Logits (before conversion)...")
     print("=" * 80)
+    prefill_model = model
     inputs_jnp = jnp.array(padded_tokens)
     positions_jnp = jnp.expand_dims(jnp.arange(trainer_config.max_prefill_predict_length), 0)
     segments_jnp = jnp.where(inputs_jnp > 0, 1, 0)
@@ -342,7 +343,7 @@ def validate_converter(argv) -> None:
             )
             
     golden_logits = np.array(logits_before[0, true_length - 1, :])
-    del logits_before
+    del logits_before, inputs_jnp, positions_jnp, segments_jnp
     gc.collect()
 
   print("=" * 80)
@@ -750,6 +751,7 @@ def validate_converter(argv) -> None:
           model_params = maxtext_vllm_state["base"] if "base" in maxtext_vllm_state else maxtext_vllm_state
           
           if trainer_config.pure_nnx:
+              # Model already in MODEL_MODE_TRAIN, just run the forward pass
               nnx.update(model, nnx.state(model, nnx.Param))
               logits_after = model(
                   decoder_input_tokens=inputs_jnp, 
@@ -774,7 +776,6 @@ def validate_converter(argv) -> None:
               print("WARNING: Logit verification failed!")
           else:
               print("Logit verification PASSED.")
-          del prefill_model
           gc.collect()
 
 
