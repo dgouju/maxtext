@@ -385,7 +385,11 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
     # (e.g. `.qvalue`) — orbax may use either form for GetAttrKey. SequenceKey
     # indexes into lists/tuples (e.g. QTensor.scale is `list[ArrayMetadata]`).
     node = stored_metadata_tree
-    for key in path:
+    skip_next = False
+    for i, key in enumerate(path):
+      if skip_next:
+        skip_next = False
+        continue
       if isinstance(key, jax.tree_util.SequenceKey):
         if isinstance(node, (list, tuple)) and 0 <= key.idx < len(node):
           node = node[key.idx]
@@ -401,6 +405,17 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
       if raw in node:
         node = node[raw]
         continue
+      
+      # Handle unscanned Linen checkpoint mapped to an NNX unscanned model.
+      # The NNX model path contains `DictKey('layers'), SequenceKey(idx)` 
+      # but the Linen checkpoint contains just `layers_{idx}`.
+      if i + 1 < len(path) and isinstance(path[i+1], jax.tree_util.SequenceKey):
+        combined_name = f"{name}_{path[i+1].idx}"
+        if combined_name in node:
+          node = node[combined_name]
+          skip_next = True
+          continue
+
       return None
     return node
 
