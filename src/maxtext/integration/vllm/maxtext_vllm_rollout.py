@@ -136,3 +136,20 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
     # Initial weight sync: run the converter so vLLM starts with real weights.
     state = nnx.state(rollout_actor)
     self._sampler.load_checkpoint(state)
+
+  def update_params(
+      self,
+      params: Any,
+      filter_types: Optional[Tuple[Any, ...]] = None,
+  ) -> None:
+    """Updates rollout parameters with logging of L2 norm for weight propagation verification."""
+    leaves = jax.tree_util.tree_leaves(params)
+    param_leaves = [p.value if hasattr(p, "value") else p for p in leaves if hasattr(p, "shape")]
+    if param_leaves:
+      import jax.numpy as jnp
+      sq_sums = [jnp.sum(jnp.square(p.astype(jnp.float32))) for p in param_leaves]
+      l2_norm = float(jnp.sqrt(sum(sq_sums)))
+      logging.info("STEP WEIGHT SYNC - MaxText Actor Model Parameters L2 Norm: %.6f", l2_norm)
+      print(f"\n[STEP WEIGHT SYNC] MaxText Actor Model Parameters L2 Norm: {l2_norm:.6f}\n", flush=True)
+    super().update_params(params, filter_types)
+
