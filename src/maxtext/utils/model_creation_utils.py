@@ -963,6 +963,13 @@ def from_pretrained(
 
         return new_target
 
+      # Filter out transient runtime variables and rngs from NNX state before constructing target_for_restore.
+      # Checkpoints on disk only store persistent weight-like parameters. If we pass the full
+      # sharded_state directly, Orbax checks the disk for transient runtime state (like the layer
+      # dropout RNG seeds) and throws a structure mismatch error when it fails to find them.
+      param_state = sharded_state.filter(
+          lambda path, var: not isinstance(var, (nnx.RngState, nnx.Cache, nnx.Intermediate, nnx.BatchStat))
+      )
       is_nnx_checkpoint = True
       if (
           "params" in metadata.item_metadata.tree.keys()
@@ -972,7 +979,7 @@ def from_pretrained(
         is_nnx_checkpoint = False
         target_for_restore = jax.tree.map(
             lambda v: v[...],
-            sharded_state,
+            param_state,
             is_leaf=lambda n: isinstance(n, nnx.Variable),
         )
 
@@ -1024,14 +1031,11 @@ def from_pretrained(
 
         # Keep persisted weight-like leaves: `nnx.Param` plus AQT serve-mode
         # `qrhs.frozen` (a separate `aqt` Variable type, NOT a Param subclass).
-        # Excluded: `nnx.RngState` (regenerated per load, shapes can drift) and
-        # `nnx.Cache` (PREFILL/AR scratch, not persisted). Pure-dict checkpoints
-        # written by `layerwise_quantization._load_and_quantize_nnx` carry both
-        # Param kernels and `aqt`-typed `qrhs.frozen` quantized payloads.
-        if hasattr(sharded_state, "filter"):
-          param_state = sharded_state.filter(lambda path, var: not isinstance(var, (nnx.RngState, nnx.Cache)))
-        else:
-          param_state = sharded_state
+        # Excluded: `nnx.RngState` (regenerated per load, shapes can drift),
+        # `nnx.Cache` (PREFILL/AR scratch, not persisted), `nnx.Intermediate`
+        # (transient forward-pass activations), and `nnx.BatchStat` (runtime statistics).
+        # Pure-dict checkpoints written by `layerwise_quantization._load_and_quantize_nnx`
+        # carry both Param kernels and `aqt`-typed `qrhs.frozen` quantized payloads.
         target_for_restore = jax.tree.map(
             _build_value_target,
             param_state,
@@ -1047,10 +1051,12 @@ def from_pretrained(
         restore_args = {"base": restore_args} if has_base_key else restore_args
 
       # Free memory used by initial sharded_state before restore, to make room for the incoming checkpoint arrays.
-      # Skip nnx.Cache variables — they hold runtime state (e.g. GDN conv/recurrent state) that is
-      # not present in the checkpoint and must remain valid after the restore.
+      # Skip transient runtime variables (RngState, Cache, Intermediate, BatchStat) — they hold runtime state
+      # that is not present in the checkpoint and must remain valid after the restore.
       def _free_device_memory(node):
-        if isinstance(node, nnx.Variable) and not isinstance(node, (nnx.RngState, nnx.Cache)):
+        if isinstance(node, nnx.Variable) and not isinstance(
+            node, (nnx.RngState, nnx.Cache, nnx.Intermediate, nnx.BatchStat)
+        ):
           inner = node.get_value() if hasattr(node, "get_value") else node[...]
           # AQT serve-mode `qrhs.frozen` wraps a QTensor (composite pytree) rather
           # than a single jax.Array. Walking via tree_leaves frees the qvalue/scale
