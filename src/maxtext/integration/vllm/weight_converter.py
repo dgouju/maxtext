@@ -178,7 +178,7 @@ class WeightConverter(abc.ABC):
             import numpy as np
             unrolled_src = {}
             for src_key, src_val in flat_src.items():
-                if "layers." in src_key and ".layers_" not in src_key:
+                if "layers." in src_key and not re.search(r'layers\.\d+', src_key) and ".layers_" not in src_key:
                     # Scanned! We need to unstack
                     layer_dim = 1
                     # fallback to 0 if dimension 1 doesn't make sense (e.g. 1D shape like (layers,))
@@ -343,23 +343,23 @@ _MODEL_TO_CONVERSION_RULES = {
         Rule(r"token_embedder\.embedding", "model.embed_tokens.weight"),
         Rule(r"decoder\.decoder_norm\.scale", "model.norm.weight"),
         Rule([r"(?:decoder\.)?logits_dense\.kernel"], "lm_head.weight", [TransposeAttentionOut()]),
-        Rule(r"decoder\.layers_(\d+)\.pre_self_attention_layer_norm\.scale", r"model.layers.\1.input_layernorm.weight"),
-        Rule(r"decoder\.layers_(\d+)\.post_self_attention_layer_norm\.scale", r"model.layers.\1.post_attention_layernorm.weight"),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.out\.kernel"], r"model.layers.{}.self_attn.o_proj.weight", [TransposeAttentionOut()]),
-        Rule([r"decoder\.layers_(\d+)\.mlp\.wo(?:\.kernel)?"], r"model.layers.{}.mlp.down_proj.weight", [TransposeAttentionOut()]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.query\.kernel", r"decoder\.layers_(\d+)\.self_attention\.key\.kernel", r"decoder\.layers_(\d+)\.self_attention\.value\.kernel"], r"model.layers.{}.self_attn.qkv_proj.weight", [_interleave_qkv(tp=0)]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.query_norm\.scale"], r"model.layers.{}.self_attn.q_norm.weight", [TransposeNorm()]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.key_norm\.scale"], r"model.layers.{}.self_attn.k_norm.weight", [TransposeNorm()]),
-        Rule([r"decoder\.layers_(\d+)\.moe_block\.gate\.kernel"], r"model.layers.{}.mlp.gate.weight", [TransposeSingle(axes=(1, 0))]),
+        Rule(r"decoder\.layers[_\.](\d+)\.pre_self_attention_layer_norm\.scale", r"model.layers.\1.input_layernorm.weight"),
+        Rule(r"decoder\.layers[_\.](\d+)\.post_self_attention_layer_norm\.scale", r"model.layers.\1.post_attention_layernorm.weight"),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.out\.kernel"], r"model.layers.{}.self_attn.o_proj.weight", [TransposeAttentionOut()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.mlp\.wo(?:\.kernel)?"], r"model.layers.{}.mlp.down_proj.weight", [TransposeAttentionOut()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.query\.kernel", r"decoder\.layers[_\.](\d+)\.self_attention\.key\.kernel", r"decoder\.layers[_\.](\d+)\.self_attention\.value\.kernel"], r"model.layers.{}.self_attn.qkv_proj.weight", [_interleave_qkv(tp=0)]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.query_norm\.scale"], r"model.layers.{}.self_attn.q_norm.weight", [TransposeNorm()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.key_norm\.scale"], r"model.layers.{}.self_attn.k_norm.weight", [TransposeNorm()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.moe_block\.gate\.kernel"], r"model.layers.{}.mlp.gate.weight", [TransposeSingle(axes=(1, 0))]),
         Rule(
-            source_patterns=[r"decoder\.layers_(\d+)\.moe_block\.wo(?:\.kernel)?"],
+            source_patterns=[r"decoder\.layers[_\.](\d+)\.moe_block\.wo(?:\.kernel)?"],
             target_pattern="model.layers.{}.mlp.experts.down_proj",
             operations=[TransposeSingle((0, 2, 1))]
         ),
         Rule(
             source_patterns=[
-                r"decoder\.layers_(\d+)\.moe_block\.wi_0(?:\.kernel)?",
-                r"decoder\.layers_(\d+)\.moe_block\.wi_1(?:\.kernel)?"
+                r"decoder\.layers[_\.](\d+)\.moe_block\.wi_0(?:\.kernel)?",
+                r"decoder\.layers[_\.](\d+)\.moe_block\.wi_1(?:\.kernel)?"
             ],
             target_pattern="model.layers.{}.mlp.experts.gate_up_proj",
             operations=[

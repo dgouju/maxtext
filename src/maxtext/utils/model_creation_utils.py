@@ -41,6 +41,7 @@ from etils import epath
 from flax import nnx
 from flax.core.meta import Partitioned
 import flax.linen as nn
+from huggingface_hub import get_token
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
@@ -385,11 +386,7 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
     # (e.g. `.qvalue`) — orbax may use either form for GetAttrKey. SequenceKey
     # indexes into lists/tuples (e.g. QTensor.scale is `list[ArrayMetadata]`).
     node = stored_metadata_tree
-    skip_next = False
-    for i, key in enumerate(path):
-      if skip_next:
-        skip_next = False
-        continue
+    for key in path:
       if isinstance(key, jax.tree_util.SequenceKey):
         if isinstance(node, (list, tuple)) and 0 <= key.idx < len(node):
           node = node[key.idx]
@@ -405,17 +402,6 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
       if raw in node:
         node = node[raw]
         continue
-      
-      # Handle unscanned Linen checkpoint mapped to an NNX unscanned model.
-      # The NNX model path contains `DictKey('layers'), SequenceKey(idx)` 
-      # but the Linen checkpoint contains just `layers_{idx}`.
-      if i + 1 < len(path) and isinstance(path[i+1], jax.tree_util.SequenceKey):
-        combined_name = f"{name}_{path[i+1].idx}"
-        if combined_name in node:
-          node = node[combined_name]
-          skip_next = True
-          continue
-
       return None
     return node
 
@@ -459,13 +445,6 @@ def _fix_restore_args_for_shape_mismatch(restore_args, stored_metadata_tree, mes
     return restore_arg
 
   fixed = jax.tree_util.tree_map_with_path(_fix_one, restore_args, is_leaf=lambda x: isinstance(x, ocp.ArrayRestoreArgs))
-
-  missing_count = len(missing_paths)
-  if missing_count > 0:
-    import logging
-    sample = "\\n".join(missing_paths[:20])
-    more = f"\\n  ... and {missing_count - 20} more" if missing_count > 20 else ""
-    logging.error(f"FOUND {missing_count} MISSING PATHS IN _fix_one:\\n{sample}{more}")
 
   if rank_mismatched_paths:
     sample = "\n".join(rank_mismatched_paths[:5])
@@ -812,6 +791,44 @@ def create_models_and_meshes(trainer_config, sampler_config, trainer_devices, sa
   return reference_model, reference_mesh, actor_model, actor_mesh, rollout_mesh
 
 
+def verify_and_sync_scan_layers(config):
+  """Verify and sync scan_layers based on checkpoint metadata."""
+  if not config.load_parameters_path:
+    return config
+
+  custom_metadata = checkpointing.load_checkpoint_metadata(config.load_parameters_path)
+  saved_scan_layers = custom_metadata.get("scan_layers")
+  if not isinstance(saved_scan_layers, bool):
+    return config
+
+  if saved_scan_layers == config.scan_layers:
+    return config
+
+  # Extract the Pydantic config (or use direct config if already a Pydantic model)
+  pydantic_config = getattr(config, "_pydantic_config", config)
+  model_fields_set = getattr(pydantic_config, "model_fields_set", None)
+
+  # If model metadata tracking isn't supported, fall back to matching check (True)
+  is_explicit = "scan_layers" in model_fields_set if model_fields_set is not None else True
+
+  if is_explicit:
+    if saved_scan_layers != config.scan_layers:
+      raise ValueError(
+          f"Configuration mismatch: Your run specifies scan_layers={config.scan_layers}, "
+          f"but the checkpoint was saved with scan_layers={saved_scan_layers}."
+      )
+  else:
+    max_logging.log(f"Setting scan_layers={saved_scan_layers} loaded from checkpoint metadata.")
+    new_pydantic_config = pydantic_config.model_copy(update={"scan_layers": saved_scan_layers})
+    # Wrap back in HyperParameters if the original config was wrapped
+    if getattr(config, "_pydantic_config", None) is not None:
+      config = pyconfig.HyperParameters(new_pydantic_config)
+    else:
+      config = new_pydantic_config
+
+  return config
+
+
 def from_pretrained(
     config,
     mesh=None,
@@ -833,8 +850,12 @@ def from_pretrained(
   if config.convert_checkpoint_if_possible and not config.load_parameters_path:
     if not (epath.Path(config.base_output_directory) / "0" / "items").exists():
       # Try to convert checkpoint on the fly
-      if not config.hf_access_token:
-        raise ValueError("hf_access_token must be provided when not providing a pre-existing checkpoint")
+      hf_access_token = config.hf_access_token or get_token()
+      if not hf_access_token:
+        raise ValueError(
+            "hf_access_token must be provided (or authenticate via"
+            " huggingface-cli) when not providing a pre-existing checkpoint"
+        )
 
       # Only process 0 performs the conversion; other processes wait at the barrier below.
       # Otherwise every host would race to download from HF and concurrently write the same
@@ -852,8 +873,8 @@ def from_pretrained(
         conversion_env = os.environ.copy()
         conversion_env["JAX_PLATFORMS"] = "cpu"
         # conversion_env["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={simulated_cpu_devices_count}"
-        if config.hf_access_token:
-          conversion_env["HF_TOKEN"] = config.hf_access_token
+        if hf_access_token:
+          conversion_env["HF_TOKEN"] = hf_access_token
 
         to_maxtext_cmd = [
             sys.executable,
@@ -886,15 +907,8 @@ def from_pretrained(
         }
     )
     config = pyconfig.HyperParameters(new_config)
-  # Proactive verification of scan_layers from checkpoint metadata
-  if config.load_parameters_path:
-    custom_metadata = checkpointing.load_checkpoint_metadata(config.load_parameters_path)
-    saved_scan_layers = custom_metadata.get("scan_layers")
-    if isinstance(saved_scan_layers, bool) and saved_scan_layers != config.scan_layers:
-      raise ValueError(
-          f"Configuration mismatch: Your run specifies scan_layers={config.scan_layers}, "
-          f"but the checkpoint was saved with scan_layers={saved_scan_layers}."
-      )
+
+  config = verify_and_sync_scan_layers(config)
 
   if config.pure_nnx:
     _create_model, abstract_model = create_nnx_abstract_model(
@@ -985,13 +999,6 @@ def from_pretrained(
 
         return new_target
 
-      # Filter out transient runtime variables and rngs from NNX state before constructing target_for_restore.
-      # Checkpoints on disk only store persistent weight-like parameters. If we pass the full
-      # sharded_state directly, Orbax checks the disk for transient runtime state (like the layer
-      # dropout RNG seeds) and throws a structure mismatch error when it fails to find them.
-      param_state = sharded_state.filter(
-          lambda path, var: not isinstance(var, (nnx.RngState, nnx.Cache, nnx.Intermediate, nnx.BatchStat))
-      )
       is_nnx_checkpoint = True
       if (
           "params" in metadata.item_metadata.tree.keys()
@@ -999,28 +1006,11 @@ def from_pretrained(
       ):
         # structure of linen checkpoint: {'params': {'params': {'decoder': ...}}}
         is_nnx_checkpoint = False
-
-        def _morph_unscanned_tree(target, meta_tree):
-          if not hasattr(target, "items") or not hasattr(meta_tree, "items"):
-            return target
-          new_target = {}
-          for k, v in target.items():
-            if k == "layers" and k not in meta_tree:
-              for idx, sub_v in v.items():
-                new_key = f"layers_{idx}"
-                if new_key in meta_tree:
-                  new_target[new_key] = _morph_unscanned_tree(sub_v, meta_tree.get(new_key, {}))
-            else:
-              new_target[k] = _morph_unscanned_tree(v, meta_tree.get(k, {}))
-          return new_target
-
         target_for_restore = jax.tree.map(
             lambda v: v[...],
-            param_state,
+            sharded_state,
             is_leaf=lambda n: isinstance(n, nnx.Variable),
         )
-
-        target_for_restore = _morph_unscanned_tree(target_for_restore, metadata.item_metadata.tree["params"]["params"])
 
         target_for_restore = _adjust_target_for_moe_fusion(
             target_for_restore, metadata.item_metadata.tree["params"]["params"], False
@@ -1070,11 +1060,14 @@ def from_pretrained(
 
         # Keep persisted weight-like leaves: `nnx.Param` plus AQT serve-mode
         # `qrhs.frozen` (a separate `aqt` Variable type, NOT a Param subclass).
-        # Excluded: `nnx.RngState` (regenerated per load, shapes can drift),
-        # `nnx.Cache` (PREFILL/AR scratch, not persisted), `nnx.Intermediate`
-        # (transient forward-pass activations), and `nnx.BatchStat` (runtime statistics).
-        # Pure-dict checkpoints written by `layerwise_quantization._load_and_quantize_nnx`
-        # carry both Param kernels and `aqt`-typed `qrhs.frozen` quantized payloads.
+        # Excluded: `nnx.RngState` (regenerated per load, shapes can drift) and
+        # `nnx.Cache` (PREFILL/AR scratch, not persisted). Pure-dict checkpoints
+        # written by `layerwise_quantization._load_and_quantize_nnx` carry both
+        # Param kernels and `aqt`-typed `qrhs.frozen` quantized payloads.
+        if hasattr(sharded_state, "filter"):
+          param_state = sharded_state.filter(lambda path, var: not isinstance(var, (nnx.RngState, nnx.Cache)))
+        else:
+          param_state = sharded_state
         target_for_restore = jax.tree.map(
             _build_value_target,
             param_state,
@@ -1090,12 +1083,10 @@ def from_pretrained(
         restore_args = {"base": restore_args} if has_base_key else restore_args
 
       # Free memory used by initial sharded_state before restore, to make room for the incoming checkpoint arrays.
-      # Skip transient runtime variables (RngState, Cache, Intermediate, BatchStat) — they hold runtime state
-      # that is not present in the checkpoint and must remain valid after the restore.
+      # Skip nnx.Cache variables — they hold runtime state (e.g. GDN conv/recurrent state) that is
+      # not present in the checkpoint and must remain valid after the restore.
       def _free_device_memory(node):
-        if isinstance(node, nnx.Variable) and not isinstance(
-            node, (nnx.RngState, nnx.Cache, nnx.Intermediate, nnx.BatchStat)
-        ):
+        if isinstance(node, nnx.Variable) and not isinstance(node, (nnx.RngState, nnx.Cache)):
           inner = node.get_value() if hasattr(node, "get_value") else node[...]
           # AQT serve-mode `qrhs.frozen` wraps a QTensor (composite pytree) rather
           # than a single jax.Array. Walking via tree_leaves frees the qvalue/scale
@@ -1126,22 +1117,6 @@ def from_pretrained(
         )
       else:
         checkpoint = restored["params"]["params"]
-        
-        def _unmorph_unscanned_tree(target):
-          if not hasattr(target, "items"):
-            return target
-          new_target = {}
-          layers_dict = {}
-          for k, v in target.items():
-            if isinstance(k, str) and k.startswith("layers_") and k[7:].isdigit():
-              layers_dict[k[7:]] = _unmorph_unscanned_tree(v)
-            else:
-              new_target[k] = _unmorph_unscanned_tree(v)
-          if layers_dict:
-            new_target["layers"] = layers_dict
-          return new_target
-          
-        checkpoint = _unmorph_unscanned_tree(checkpoint)
 
       if checkpoint:
         # Same QTensor caveat as `_build_value_target` / `_free_device_memory`:
@@ -1186,15 +1161,7 @@ def from_pretrained(
           """Recursively keep only keys present in model, dropping checkpoint-only fields (e.g. to_nnx__rngs)."""
           if not hasattr(ckpt, "items") or not hasattr(model, "items"):
             return ckpt
-          res = {}
-          for k in model:
-            if k in ckpt:
-              res[k] = _filter_to_model_keys(ckpt[k], model[k])
-            elif str(k) in ckpt:
-              res[k] = _filter_to_model_keys(ckpt[str(k)], model[k])
-            elif isinstance(k, str) and k.isdigit() and int(k) in ckpt:
-              res[k] = _filter_to_model_keys(ckpt[int(k)], model[k])
-          return res
+          return {k: _filter_to_model_keys(ckpt[k], model[k]) for k in model if k in ckpt}
 
         checkpoint = _filter_to_model_keys(checkpoint, model_arrays)
 
@@ -1217,13 +1184,6 @@ def from_pretrained(
           return _align_checkpoint_to_model_shapes(ckpt, model_arr, axes)
 
         checkpoint = _walk_align(checkpoint, model_arrays, logical_axes_tree)
-        
-        def _check_not_deleted(node):
-          if isinstance(node, jax.Array) and node.is_deleted():
-            raise RuntimeError("FOUND DELETED ARRAY BEFORE NNX UPDATE")
-          return node
-        jax.tree_util.tree_map(_check_not_deleted, checkpoint)
-        
         nnx.update(model, checkpoint)
       else:
         raise ValueError(
