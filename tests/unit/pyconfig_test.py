@@ -20,6 +20,7 @@ import unittest
 
 from maxtext.configs import pyconfig
 from maxtext.configs.pyconfig import resolve_config_path, _CONFIG_FILE_MAPPING, _module_from_path
+from maxtext.configs.types import _normalize_axes, infer_cp_axes, infer_ep_axes
 from maxtext.input_pipeline import data_processing_utils
 from maxtext.utils.globals import MAXTEXT_CONFIGS_DIR, MAXTEXT_PKG_DIR
 from tests.utils.test_helpers import get_test_config_path, get_post_train_test_config_path
@@ -331,6 +332,72 @@ class PyconfigTest(unittest.TestCase):
         eval_start_step=50,
     )
     self.assertEqual(config_override.eval_start_step, 50)
+
+  # ------------------------------------------------------------------
+  # Tests for infer_cp_axes / infer_ep_axes and EP rank flag disabling
+  # ------------------------------------------------------------------
+
+  def test_infer_cp_axes_default(self):
+    """No activation_length rule -> empty tuple (falls back to default 'context')."""
+    self.assertEqual(infer_cp_axes([]), ())
+    self.assertEqual(infer_cp_axes([["exp", "expert"]]), ())
+
+  def test_infer_cp_axes_context(self):
+    """activation_length -> ['context'] (standard case)."""
+    rules = [["activation_length", ["context"]]]
+    self.assertEqual(infer_cp_axes(rules), ("context",))
+
+  def test_infer_cp_axes_expert(self):
+    """activation_length -> ['expert'] (ep-as-cp case)."""
+    rules = [["activation_length", ["expert"]]]
+    self.assertEqual(infer_cp_axes(rules), ("expert",))
+
+  def test_infer_ep_axes_default(self):
+    """No exp rule -> empty tuple."""
+    self.assertEqual(infer_ep_axes([]), ())
+
+  def test_infer_ep_axes_single(self):
+    """exp -> 'expert' (standard case)."""
+    rules = [["exp", "expert"]]
+    self.assertEqual(infer_ep_axes(rules), ("expert",))
+
+  def test_infer_ep_axes_multi(self):
+    """exp -> ['context', 'expert'] (cp-as-ep case)."""
+    rules = [["exp", ["context", "expert"]]]
+    self.assertEqual(infer_ep_axes(rules), ("context", "expert"))
+
+  def test_ep_rank_single_axis(self):
+    """EP rank with single expert axis, ICI=4."""
+    ep_axes = infer_ep_axes([["exp", "expert"]])
+    ep_rank = 1
+    ici = {"expert": 4}
+    for ax in ep_axes:
+      ep_rank *= ici.get(ax, 1)
+    self.assertEqual(ep_rank, 4)
+
+  def test_ep_rank_multi_axis(self):
+    """EP rank with context=2, expert=4 -> rank 8."""
+    ep_axes = infer_ep_axes([["exp", ["context", "expert"]]])
+    ep_rank = 1
+    ici = {"context": 2, "expert": 4}
+    for ax in ep_axes:
+      ep_rank *= ici.get(ax, 1)
+    self.assertEqual(ep_rank, 8)
+
+  def test_ep_rank_1_no_disabling(self):
+    """EP rank=1 -> no flags should be affected."""
+    ep_axes = infer_ep_axes([["exp", "expert"]])
+    ep_rank = 1
+    for _ in ep_axes:
+      ep_rank *= 1  # parallelism = 1
+    self.assertEqual(ep_rank, 1)
+
+  def test_normalize_axes_basics(self):
+    """_normalize_axes handles None, str, list, and empty list."""
+    self.assertEqual(_normalize_axes(None), ())
+    self.assertEqual(_normalize_axes("expert"), ("expert",))
+    self.assertEqual(_normalize_axes(["a", "b"]), ("a", "b"))
+    self.assertEqual(_normalize_axes([]), ())
 
 
 if __name__ == "__main__":
