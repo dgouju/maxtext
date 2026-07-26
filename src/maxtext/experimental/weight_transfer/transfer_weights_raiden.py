@@ -241,7 +241,6 @@ def build_resharding_start_request(
           entry.src_stride_bytes = src_cols * itemsize
           entry.dst_stride_bytes = dst_cols * itemsize
           entry.count = c_rows
-      break
 
   return start_req if has_reshard else raiden_service_pb2.StartTransferRequest(is_sender=True)
 
@@ -323,30 +322,33 @@ def transfer_and_benchmark(
   jax.tree.map(lambda x: x.block_until_ready(), flat_src)
   jax.tree.map(lambda x: x.block_until_ready(), flat_dst_init)
 
+  last_syncer_dst = None
+  use_raiden_rpc = True
+
   print(f"\n--- Running Benchmark: {name} ---", flush=True)
   print(f"Total payload size: {total_mb:.2f} MB ({total_bytes} bytes)", flush=True)
 
   start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
 
   if jax.process_count() > 1:
+    syncer_src = None
     syncer_dst = None
+    if jax.process_index() == 0:
+      syncer_src = weight_synchronizer.WeightSynchronizer(
+          flat_src, bind_ip=args.source_ip, listener_port=args.dest_port + 100
+      )
+    elif jax.process_index() == 1:
+      syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port)
+      last_syncer_dst = syncer_dst
+    multihost_utils.sync_global_devices("syncer_init_done")
+
     for w in range(args.warmup_iterations):
       multihost_utils.sync_global_devices(f"warmup_start_{w}")
       print(f"  Warmup iteration {w + 1}/{args.warmup_iterations}...", flush=True)
-      port_offset = w
       if jax.process_index() == 0:
-        start_req = build_resharding_start_request(
-            flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port + port_offset
-        )
-        syncer_src = weight_synchronizer.WeightSynchronizer(
-            flat_src, bind_ip=args.source_ip, listener_port=args.dest_port + 100 + port_offset
-        )
+        start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
         syncer_src.d2h()
-        trigger_raiden_transfer(
-            syncer_src, args.dest_ip, ws_dest=args.dest_port + port_offset, start_transfer_req=start_req
-        )
-      elif jax.process_index() == 1:
-        syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port + port_offset)
+        trigger_raiden_transfer(syncer_src, args.dest_ip, ws_dest=args.dest_port, start_transfer_req=start_req)
       multihost_utils.sync_global_devices(f"warmup_end_{w}")
 
     if args.profile_dir:
@@ -359,28 +361,14 @@ def transfer_and_benchmark(
       multihost_utils.sync_global_devices(f"iter_start_{it}")
       t0 = time.perf_counter()
 
-      port_offset = args.warmup_iterations + it
       if jax.process_index() == 0:
-        start_req = build_resharding_start_request(
-            flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port + port_offset
-        )
-        syncer_src = weight_synchronizer.WeightSynchronizer(
-            flat_src, bind_ip=args.source_ip, listener_port=args.dest_port + 100 + port_offset
-        )
+        start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
         syncer_src.d2h()
-        src_buf = np.frombuffer(bytes(syncer_src.get_host_buffer(0, 0)), dtype=np.float32)
-        print(f"[DEBUG_HOST_BUF] src host buffer after D2H: {src_buf[:5]}", flush=True)
-        trigger_raiden_transfer(
-            syncer_src, args.dest_ip, ws_dest=args.dest_port + port_offset, start_transfer_req=start_req
-        )
-      elif jax.process_index() == 1:
-        syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port + port_offset)
+        trigger_raiden_transfer(syncer_src, args.dest_ip, ws_dest=args.dest_port, start_transfer_req=start_req)
 
       multihost_utils.sync_global_devices(f"transfer_done_{it}")
       if jax.process_index() == 1:
         syncer_dst.h2d()
-        dst_buf = np.frombuffer(bytes(syncer_dst.get_host_buffer(0, 0)), dtype=np.float32)
-        print(f"[DEBUG_HOST_BUF] dst host buffer after transfer & H2D: {dst_buf[:5]}", flush=True)
 
       t1 = time.perf_counter()
 
@@ -444,7 +432,18 @@ def transfer_and_benchmark(
 
   if args.verify_correctness:
     if jax.process_count() == 1 or jax.process_index() == 1:
-      transferred_weights = jax.tree.unflatten(treedef, transferred_flat)
+      if use_raiden_rpc and jax.process_count() > 1 and last_syncer_dst is not None:
+        last_syncer_dst.d2h()
+        transferred_flat_from_hbm = []
+        for idx, arr in enumerate(flat_dst_init):
+          h_buf = np.frombuffer(bytes(last_syncer_dst.get_host_buffer(idx, 0)), dtype=np.float32)[: arr.size].reshape(
+              arr.shape
+          )
+          transferred_flat_from_hbm.append(h_buf)
+        transferred_weights = jax.tree.unflatten(treedef, transferred_flat_from_hbm)
+      else:
+        transferred_flat_materialized = [jax.jit(lambda x: x * 1.0)(arr) for arr in transferred_flat]
+        transferred_weights = jax.tree.unflatten(treedef, transferred_flat_materialized)
       for k in src_weights.keys():
         src_k = np.array(src_weights[k]["kernel"])
         dst_k = np.array(transferred_weights[k]["kernel"])
