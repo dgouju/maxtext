@@ -105,7 +105,32 @@ class _interleave_qkv(Operation):
         qkv_flat = qkv_by_tp.reshape(-1, d_model)
         return qkv_flat
 
-
+class _interleave_w13(Operation):
+    def __init__(self, tp: int): 
+        self.tp = tp
+        
+    def __call__(self, tensors):
+        w0, w1 = tensors
+        
+        w0 = jnp.transpose(w0, (0, 2, 1))
+        w1 = jnp.transpose(w1, (0, 2, 1))
+        num_experts, d_inner, d_model = w0.shape
+        tp = self.tp
+        chunk_size = d_inner // tp
+        
+        padded_chunk_size = ((chunk_size + 127) // 128) * 128
+        pad_amount = padded_chunk_size - chunk_size
+        
+        gate_chunks = w0.reshape(num_experts, tp, chunk_size, d_model)
+        up_chunks = w1.reshape(num_experts, tp, chunk_size, d_model)
+        
+        if pad_amount > 0:
+            gate_chunks = jnp.pad(gate_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0)))
+            up_chunks = jnp.pad(up_chunks, ((0, 0), (0, 0), (0, pad_amount), (0, 0)))
+            
+        combined = jnp.stack([gate_chunks, up_chunks], axis=2)
+        combined = combined.reshape(num_experts, 2 * padded_chunk_size * tp, d_model)
+        return jnp.transpose(combined, (0, 2, 1))
 
 class TransposeAttentionOut(Operation):
     def __call__(self, tensors):
@@ -113,6 +138,13 @@ class TransposeAttentionOut(Operation):
         if len(out.shape) == 3:
             return jnp.transpose(out.reshape(-1, out.shape[2]), (1, 0))
         return jnp.transpose(out)
+
+class QKVProjHF(Operation):
+    def __call__(self, tensors):
+        q = tensors[0] if isinstance(tensors, list) else tensors
+        # MaxText Qwen3 scanned attention kernels are (d_model, num_heads, head_dim)
+        # Transpose to [num_heads, head_dim, d_model] and flatten
+        return jnp.transpose(q, (1, 2, 0)).reshape(-1, q.shape[0])
 
 class TransposeNorm(Operation):
     def __call__(self, tensors):
@@ -238,7 +270,7 @@ class WeightConverter(abc.ABC):
                                 dst_dict[target_key] = src_val
                                 break
                             
-                        matched_groups[digits].append((i, src_val))
+                        matched_groups[digits].append((i, src_val, src_key))
             if "gate_up_proj" in rule.target_pattern:
                 print(f"DEBUG {rule.target_pattern}: matched_groups: {matched_groups.keys()}", flush=True)
                 for ks in matched_groups.keys():
@@ -255,14 +287,16 @@ class WeightConverter(abc.ABC):
                     result = tensors
                     for op in rule.operations:
                         # inject the correct tp, override the default tp=0
-                        if isinstance(op, _interleave_qkv) and op.tp == 0:
+                        if isinstance(op, (_interleave_qkv, _interleave_w13)) and op.tp == 0:
                             op.tp = self.tp
                         result = op(result)
                     
                     if len(rule.source_patterns) == 1 and not rule.operations and digits:
-                        # Simple renaming with grouped strings e.g. "model.layers.\1.input_layernorm.weight"
-                        src_key = next(k for k in flat_src.keys() if source_regexes[0].search(k) and tuple(re.findall(r'\d+', k)) == digits)
-                        target_key = source_regexes[0].sub(rule.target_pattern, src_key)
+                        src_key = matched_items[0][2]
+                        if '{}' in rule.target_pattern:
+                            target_key = rule.target_pattern.format(*digits)
+                        else:
+                            target_key = source_regexes[0].sub(rule.target_pattern, src_key)
                         res = result[0] if isinstance(result, list) and len(result) == 1 else result
                         if target_state is None:
                             res = jax.device_put(res, jax.devices("cpu")[0])
@@ -330,14 +364,17 @@ _MODEL_TO_CONVERSION_RULES = {
         Rule(r"token_embedder\.embedding", "model.embed_tokens.weight"),
         Rule(r"decoder\.decoder_norm\.scale", "model.norm.weight"),
         Rule([r"(?:decoder\.)?logits_dense\.kernel"], "lm_head.weight", [TransposeAttentionOut()]),
-        Rule(r"decoder\.layers_(\d+)\.pre_self_attention_layer_norm\.scale", r"model.layers.\1.input_layernorm.weight"),
-        Rule(r"decoder\.layers_(\d+)\.post_self_attention_layer_norm\.scale", r"model.layers.\1.post_attention_layernorm.weight"),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.out\.kernel"], r"model.layers.{}.self_attn.o_proj.weight", [TransposeAttentionOut()]),
-        Rule([r"decoder\.layers_(\d+)\.mlp\.wo(?:\.kernel)?"], r"model.layers.{}.mlp.down_proj.weight", [TransposeAttentionOut()]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.query\.kernel", r"decoder\.layers_(\d+)\.self_attention\.key\.kernel", r"decoder\.layers_(\d+)\.self_attention\.value\.kernel"], r"model.layers.{}.self_attn.qkv_proj.weight", [_interleave_qkv(tp=0)]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.query_norm\.scale"], r"model.layers.{}.self_attn.q_norm.weight", [TransposeNorm()]),
-        Rule([r"decoder\.layers_(\d+)\.self_attention\.key_norm\.scale"], r"model.layers.{}.self_attn.k_norm.weight", [TransposeNorm()]),
-        Rule([r"decoder\.layers_(\d+)\.mlp\.wi_0(?:\.kernel)?", r"decoder\.layers_(\d+)\.mlp\.wi_1(?:\.kernel)?"], r"model.layers.{}.mlp.gate_up_proj.weight", [Concatenate(dim=1), TransposeSingle((1,0))]),
+        Rule(r"decoder\.layers[_\.](\d+)\.pre_self_attention_layer_norm\.scale", r"model.layers.\1.input_layernorm.weight"),
+        Rule(r"decoder\.layers[_\.](\d+)\.post_self_attention_layer_norm\.scale", r"model.layers.\1.post_attention_layernorm.weight"),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.out\.kernel"], r"model.layers.{}.self_attn.o_proj.weight", [TransposeAttentionOut()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.mlp\.wo(?:\.kernel)?"], r"model.layers.{}.mlp.down_proj.weight", [TransposeAttentionOut()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.query\.kernel"], r"model.layers.{}.self_attn.q_proj.weight", [QKVProjHF()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.key\.kernel"], r"model.layers.{}.self_attn.k_proj.weight", [QKVProjHF()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.value\.kernel"], r"model.layers.{}.self_attn.v_proj.weight", [QKVProjHF()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.query_norm\.scale"], r"model.layers.{}.self_attn.q_norm.weight", [TransposeNorm()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.self_attention\.key_norm\.scale"], r"model.layers.{}.self_attn.k_norm.weight", [TransposeNorm()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.mlp\.wi_0(?:\.kernel)?"], r"model.layers.{}.mlp.gate_proj.weight", [TransposeAttentionOut()]),
+        Rule([r"decoder\.layers[_\.](\d+)\.mlp\.wi_1(?:\.kernel)?"], r"model.layers.{}.mlp.up_proj.weight", [TransposeAttentionOut()]),
     ],
     "qwen3_moe": [
         Rule(r"token_embedder\.embedding", "model.embed_tokens.weight"),
@@ -353,7 +390,7 @@ _MODEL_TO_CONVERSION_RULES = {
         Rule([r"decoder\.layers[_\.](\d+)\.moe_block\.gate\.kernel"], r"model.layers.{}.mlp.gate.weight", [TransposeSingle(axes=(1, 0))]),
         Rule(
             source_patterns=[r"decoder\.layers[_\.](\d+)\.moe_block\.wo(?:\.kernel)?"],
-            target_pattern="model.layers.{}.mlp.experts.down_proj",
+            target_pattern="model.layers.{}.mlp.experts.w2_weight",
             operations=[TransposeSingle((0, 2, 1))]
         ),
         Rule(
@@ -361,11 +398,8 @@ _MODEL_TO_CONVERSION_RULES = {
                 r"decoder\.layers[_\.](\d+)\.moe_block\.wi_0(?:\.kernel)?",
                 r"decoder\.layers[_\.](\d+)\.moe_block\.wi_1(?:\.kernel)?"
             ],
-            target_pattern="model.layers.{}.mlp.experts.gate_up_proj",
-            operations=[
-                Concatenate(dim=2),
-                TransposeSingle((0, 2, 1))
-            ]
+            target_pattern="model.layers.{}.mlp.experts.w13_weight",
+            operations=[_interleave_w13(tp=0)]
         )
     ]
 }

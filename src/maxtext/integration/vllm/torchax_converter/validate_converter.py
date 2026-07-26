@@ -44,6 +44,8 @@ import tempfile
 import time
 from typing import Sequence
 
+import os
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.4"
 from absl import app
 import jax
 import jax.numpy as jnp
@@ -102,14 +104,17 @@ def _is_non_layer_key(key: str) -> bool:
   return "layers." not in key
 
 def _weight_stats_str(arr) -> str:
-  a = jnp.array(arr).astype(jnp.float32)
-  return (
-      f"shape={tuple(arr.shape)} dtype={arr.dtype} "
-      f"mean_abs={float(jnp.mean(jnp.abs(a))):.6f} "
-      f"std={float(jnp.std(a)):.6f} "
-      f"min={float(jnp.min(a)):.6f} "
-      f"max={float(jnp.max(a)):.6f}"
-  )
+  try:
+    a = jnp.array(arr).astype(jnp.float32)
+    return (
+        f"shape={tuple(arr.shape)} dtype={arr.dtype} "
+        f"mean_abs={float(jnp.mean(jnp.abs(a))):.6f} "
+        f"std={float(jnp.std(a)):.6f} "
+        f"min={float(jnp.min(a)):.6f} "
+        f"max={float(jnp.max(a)):.6f}"
+    )
+  except Exception as e:
+    return f"shape={getattr(arr, 'shape', 'unknown')} (stats err: {type(e).__name__})"
 
 def _log_weight_stats(converted_state: dict, vllm_state: dict, compare: bool) -> None:
   keys = sorted(k for k in converted_state if _is_non_layer_key(k) or _is_layer0_key(k))
@@ -121,11 +126,17 @@ def _log_weight_stats(converted_state: dict, vllm_state: dict, compare: bool) ->
       weight_array = arr.value if hasattr(arr, "value") else arr
       logging.info("  [CONVERTED] %s | %s", key, _weight_stats_str(weight_array))
     if compare and key in vllm_state:
-      ref = np.array(vllm_state[key], dtype=np.float32)
-      conv = np.array(weight_array, dtype=np.float32)
-      rel_frob = float(np.linalg.norm(conv - ref)) / (float(np.linalg.norm(ref)) + 1e-8)
-      logging.info("  [VLLM-REF]  %s | %s", key, _weight_stats_str(vllm_state[key]))
-      logging.info("  [DIFF]      %s | rel_frobenius=%.6f", key, rel_frob)
+      vllm_val = vllm_state[key]
+      vllm_array = vllm_val.value if hasattr(vllm_val, "value") else vllm_val
+      try:
+          ref = np.array(vllm_array, dtype=np.float32)
+          conv = np.array(weight_array, dtype=np.float32)
+          rel_frob = float(np.linalg.norm(conv - ref)) / (float(np.linalg.norm(ref)) + 1e-8)
+          logging.info("  [VLLM-REF]  %s | %s", key, _weight_stats_str(vllm_array))
+          logging.info("  [DIFF]      %s | rel_frobenius=%.6f", key, rel_frob)
+      except Exception as e:
+          logging.info("  [VLLM-REF]  %s | %s", key, _weight_stats_str(vllm_array))
+          logging.info("  [DIFF]      %s | rel_frobenius=error: %s", key, type(e).__name__)
   logging.info("=" * 80)
 
 def _check_key_coverage(llm_state: dict, converted_state: dict) -> None:
@@ -138,21 +149,26 @@ def _check_key_coverage(llm_state: dict, converted_state: dict) -> None:
   if missing:
     logging.warning("Keys in vLLM state NOT in converted state (%d):", len(missing))
     for k in sorted(missing):
-      logging.warning("  MISSING: %s  vllm_shape=%s", k, llm_state[k].shape)
+      val = llm_state[k]
+      val_arr = val.value if hasattr(val, "value") else val
+      logging.warning("  MISSING: %s  vllm_shape=%s", k, getattr(val_arr, "shape", "unknown"))
 
   if extra:
     logging.warning("Keys in converted state NOT in vLLM state (%d):", len(extra))
     for k in sorted(extra):
       arr = converted_state[k]
-      logging.warning("  EXTRA:   %s  converted_shape=%s", k, (arr.value if hasattr(arr, "value") else arr).shape)
+      val_arr = arr.value if hasattr(arr, "value") else arr
+      logging.warning("  EXTRA:   %s  converted_shape=%s", k, getattr(val_arr, "shape", "unknown"))
 
   shape_mismatches = []
   for key in sorted(vllm_keys & converted_keys):
     arr = converted_state[key]
     weight_array = arr.value if hasattr(arr, "value") else arr
-    vshape = llm_state[key].shape
-    cshape = weight_array.shape
-    if vshape != cshape:
+    vllm_val = llm_state[key]
+    vllm_array = vllm_val.value if hasattr(vllm_val, "value") else vllm_val
+    vshape = getattr(vllm_array, "shape", None)
+    cshape = getattr(weight_array, "shape", None)
+    if vshape is not None and cshape is not None and vshape != cshape:
       shape_mismatches.append((key, vshape, cshape))
 
   if shape_mismatches:
@@ -254,46 +270,68 @@ def validate_converter(argv) -> None:
   
   # Determine base name for rules
   base_name = trainer_config.model_name.split("-")[0]
-  if "moe" in trainer_config.model_name or "qwen3-30b" in trainer_config.model_name or "qwen3.5" in trainer_config.model_name:
+  is_moe_model = "moe" in trainer_config.model_name or "qwen3-30b" in trainer_config.model_name or "qwen3.5" in trainer_config.model_name
+  if is_moe_model:
       if "qwen3" in trainer_config.model_name:
           base_name = "qwen3_moe"
           
   rules = _MODEL_TO_CONVERSION_RULES.get(base_name, None)
   
-  # 1. Custom Standalone Converter
-  print("\n--- Running Custom Standalone Converter ---")
-  start_time = time.time()
-  try:
-      if trainer_config.model_name.startswith("gemma4"):
-          standalone = Gemma4MaxTextToVLLMConverter(trainer_config, mesh)
-      elif trainer_config.model_name.startswith("qwen3.5"):
-          standalone = Qwen35MaxTextToVLLMConverter(trainer_config, mesh)
-      else:
-          standalone = Qwen3MaxTextToVLLMConverter(trainer_config, mesh)
-          
-      with timer("Conversion (Legacy Standalone)"):
-          legacy_state = standalone.convert(model_state)
-      print(f"[Performance] Legacy Converter execution time: {time.time() - start_time:.4f} seconds.")
-  except Exception as e:
-      print(f"Legacy Standalone Converter failed/skipped: {e}")
-      legacy_state = None
-      
-  # 2. WeightConverter HF
+  legacy_state = None
   rules_hf_state = None
-  if rules is not None:
-      print("\n--- Running WeightConverter (maxtext -> HF) ---")
-      start_time = time.time()
-      try:
-          new_converter_hf = WeightConverter(rules, tp=1)
-          with timer("Conversion (WeightConverter HF)"):
-              rules_hf_state = new_converter_hf.convert(model_state)
-          print(f"[Performance] WeightConverter HF execution time: {time.time() - start_time:.4f} seconds.")
-      except Exception as e:
-          print(f"WeightConverter HF failed: {e}")
-
-  # 3. WeightConverter MaxText
   rules_maxtext_state = None
-  if rules is not None:
+  
+  if requested_scenario == "hf":
+      # WeightConverter HF
+      if rules is not None:
+          print("\n--- Running WeightConverter (maxtext -> HF) ---")
+          start_time = time.time()
+          try:
+              new_converter_hf = WeightConverter(rules, tp=tp)
+              with timer("Conversion (WeightConverter HF)"):
+                  rules_hf_state = new_converter_hf.convert(model_state)
+              print(f"[Performance] WeightConverter HF execution time: {time.time() - start_time:.4f} seconds.")
+          except Exception as e:
+              import traceback
+              print(f"WeightConverter HF failed: {traceback.format_exc()}", flush=True)
+
+      # Legacy Standalone Converter (only if MoE model)
+      if is_moe_model:
+          print("\n--- Running Custom Standalone Converter (for side-by-side comparison) ---")
+          start_time = time.time()
+          try:
+              if trainer_config.model_name.startswith("gemma4"):
+                  standalone = Gemma4MaxTextToVLLMConverter(trainer_config, mesh)
+              elif trainer_config.model_name.startswith("qwen3.5"):
+                  standalone = Qwen35MaxTextToVLLMConverter(trainer_config, mesh)
+              else:
+                  standalone = Qwen3MaxTextToVLLMConverter(trainer_config, mesh)
+                  
+              with timer("Conversion (Legacy Standalone)"):
+                  legacy_state = standalone.convert(model_state)
+              print(f"[Performance] Legacy Converter execution time: {time.time() - start_time:.4f} seconds.")
+          except Exception as e:
+              print(f"Legacy Standalone Converter failed/skipped: {e}")
+              legacy_state = None
+              
+      # Verify WaitConverter HF vs Legacy
+      if rules_hf_state is not None and legacy_state is not None:
+          print("\n--- Verifying WeightConverter vs Legacy Standalone ---")
+          hf_keys = set(rules_hf_state.keys())
+          legacy_keys = set(legacy_state.keys())
+          if hf_keys != legacy_keys:
+              missing_in_legacy = hf_keys - legacy_keys
+              missing_in_hf = legacy_keys - hf_keys
+              print(f"FAILED: Keys mismatch! Missing in Legacy: {len(missing_in_legacy)}, Missing in HF: {len(missing_in_hf)}")
+              if missing_in_legacy: print(f"Sample extra in HF: {list(missing_in_legacy)[:5]}")
+              if missing_in_hf: print(f"Sample missing in HF: {list(missing_in_hf)[:5]}")
+          else:
+              print("SUCCESS: WeightConverter HF keys exactly match Legacy Standalone Converter!")
+              
+      maxtext_vllm_state = rules_hf_state if rules_hf_state is not None else legacy_state
+
+  else:
+      # requested_scenario == "maxtext"
       print("\n--- Running WeightConverter (maxtext -> maxtext format) ---")
       start_time = time.time()
       try:
@@ -304,14 +342,11 @@ def validate_converter(argv) -> None:
           print(f"[Performance] WeightConverter MaxText execution time: {time.time() - start_time:.4f} seconds.")
       except Exception as e:
           print(f"WeightConverter MaxText failed: {e}")
-      
-  # Decide the primary state for generation based on scenario requirements:
-  if requested_scenario == "hf":
-      maxtext_vllm_state = rules_hf_state if rules_hf_state is not None else legacy_state
-  else:
-      maxtext_vllm_state = rules_maxtext_state if rules_maxtext_state is not None else legacy_state
+          
+      maxtext_vllm_state = rules_maxtext_state
 
   # Clean up unneeded model state
+  import gc
   needed_ids = {id(w.value if hasattr(w, "value") else w) for w in jax.tree_util.tree_leaves(maxtext_vllm_state)}
   for arr in jax.tree_util.tree_leaves(model_state):
     arr_true = arr.value if hasattr(arr, "value") else arr
@@ -336,20 +371,19 @@ def validate_converter(argv) -> None:
   print(f"Loading vLLM model (load_format={vllm_load_format})...")
   print("=" * 80)
   
-  dp_size = sampler_config.rollout_data_parallelism
-  if dp_size <= 0:
-    tp_size = getattr(sampler_config, "rollout_tensor_parallelism", 1)
-    num_devices = len(sampler_devices) if sampler_devices else 1
-    dp_size = max(1, num_devices // tp_size)
+  # Hardcode dp_size=1 to avoid multiprocessing and JAX deadlocks
+  dp_size = 1
+  tp_size = getattr(sampler_config, "rollout_tensor_parallelism", 1)
 
   vllm_kwargs = {
       "model": vllm_model_name_mapping[trainer_config.model_name],
       "max_model_len": trainer_config.max_target_length,
       "load_format": vllm_load_format,
       "data_parallel_size": dp_size,
-      "tensor_parallel_size": sampler_config.rollout_tensor_parallelism,
-      "gpu_memory_utilization": getattr(sampler_config, "hbm_utilization_vllm", 0.5),
+      "tensor_parallel_size": len(sampler_devices) if sampler_config.rollout_tensor_parallelism == -1 else sampler_config.rollout_tensor_parallelism,
+      "gpu_memory_utilization": getattr(sampler_config, "hbm_utilization_vllm", 0.4),
       "async_scheduling": getattr(sampler_config, "async_scheduling", False),
+      "distributed_executor_backend": "mp",
   }
   if vllm_hf_overrides_val:
       import yaml
@@ -368,10 +402,11 @@ def validate_converter(argv) -> None:
     vllm_kwargs["max_num_batched_tokens"] = 16384
 
   if multislice:
+    tp_size_actual = vllm_kwargs["tensor_parallel_size"]
     vllm_kwargs["additional_config"] = {
         "sharding": {
             "sharding_strategy": {
-                "device_indexes": [d.id for d in sampler_devices],
+                "device_indexes": [d.id for d in sampler_devices][:dp_size * tp_size_actual],
             }
         }
     }
@@ -449,14 +484,23 @@ def validate_converter(argv) -> None:
     print("=" * 80)
     print("Checking key coverage and shapes...")
     print("=" * 80)
-    _check_key_coverage(golden_llm_state, maxtext_vllm_state)
+    def to_pure(d): return d.to_pure_dict() if hasattr(d, "to_pure_dict") else dict(d) if hasattr(d, "items") else d
+    from flax.traverse_util import flatten_dict
+    
+    raw_flat_golden = flatten_dict(to_pure(golden_llm_state))
+    flat_golden = {".".join(str(k) for k in key): val for key, val in raw_flat_golden.items()}
+    
+    raw_flat_converted = flatten_dict(to_pure(maxtext_vllm_state))
+    flat_converted = {".".join(str(k) for k in key): val for key, val in raw_flat_converted.items()}
+    
+    _check_key_coverage(flat_golden, flat_converted)
 
     compare_stats = (vllm_load_format != "dummy")
-    _log_weight_stats(maxtext_vllm_state, golden_llm_state, compare=compare_stats)
+    _log_weight_stats(flat_converted, flat_golden, compare=compare_stats)
 
     if gcs_debug_path:
       with timer("GCS tensor upload"):
-        _upload_tensors_to_gcs(maxtext_vllm_state, gcs_debug_path)
+        _upload_tensors_to_gcs(flat_converted, gcs_debug_path)
 
   # --- Weight assignment ----------------------------------------------------
   print(f"\n--- Weight Assignment ({requested_scenario} mode) ---")
@@ -487,46 +531,55 @@ def validate_converter(argv) -> None:
           golden_llm_state.update(unflatten_dict(resharded_flat))
           
     else:
-      is_nnx_model = False
-      if hasattr(golden_llm_state, "keys"):
-          pass
-      else:
-          is_nnx_model = True
-          try:
-              tmp_st = nnx.state(golden_llm_state, nnx.Param)
-              from flax.traverse_util import flatten_dict
-              golden_llm_state_dict = flatten_dict(tmp_st.to_pure_dict(), sep=".")
-          except Exception as e:
-              print(f"Failed to flatten: {e}", flush=True)
-              import sys; sys.exit(1)
-              
-      for key, weight in maxtext_vllm_state.items():
-        if is_nnx_model:
-            target_dict = golden_llm_state_dict
-        else:
-            target_dict = golden_llm_state
-            
-        if key in target_dict:
-            try:
-                weight_array = weight.value if hasattr(weight, "value") else weight
-                dst_sharding = target_dict[key].sharding if hasattr(target_dict[key], "sharding") else None
-                if dst_sharding:
-                    target_dict[key] = reshard_pytree(weight_array, dst_sharding, donate_input=False, cache_plan=True)
-                else:
-                    target_dict[key] = weight_array
-            except Exception as e:
-                import traceback
-                print(f"CRASH ON KEY: {key}")
-                traceback.print_exc()
-                import sys
-                sys.exit(1)
-                
-      if is_nnx_model:
-          from flax.traverse_util import unflatten_dict
-          unflat_dict = unflatten_dict({tuple(k.split('.')): v for k, v in golden_llm_state_dict.items()})
-          nnx.update(golden_llm_state, unflat_dict)
+      def _to_pure_dict(x):
+          if hasattr(x, "to_pure_dict"): return x.to_pure_dict()
+          if isinstance(x, dict): return {k: _to_pure_dict(v) for k, v in x.items()}
+          return x
+
+      from flax.traverse_util import flatten_dict, unflatten_dict
+      maxtext_pure = _to_pure_dict(maxtext_vllm_state)
+      maxtext_vllm_flat_tuples = flatten_dict(maxtext_pure)
+      maxtext_vllm_flat = {".".join(str(k) for k in key_tuple): v for key_tuple, v in maxtext_vllm_flat_tuples.items()}
+      
+      print("="*40)
+      print("DUMPING maxtext_vllm_flat SHAPES (HF):")
+      for k in list(maxtext_vllm_flat.keys())[:10]:
+          v = maxtext_vllm_flat[k]
+          if hasattr(v, "shape"):
+              print(f"  {k}: {v.shape}")
+          else:
+              print(f"  {k}: No shape")
+      print("="*40)
+      
+      hf_weights_iterable = [(k, v.value if hasattr(v, "value") else v) for k, v in maxtext_vllm_flat.items()]
+      try:
+          import torch
+          # Some hugging face weight loading maps to PyTorch natively, let's cast them
+          def convert_to_pt(arr):
+              import numpy as np
+              arr_np = np.array(arr)
+              if str(arr_np.dtype) in ("bfloat16", "ml_dtypes.bfloat16", "bfloat16_0"):
+                  return torch.from_numpy(arr_np.astype(np.float32)).to(torch.bfloat16)
+              return torch.from_numpy(arr_np)
+          hf_weights_iterable = [(k, convert_to_pt(v)) for k, v in hf_weights_iterable]
+          
+          llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(hf_weights_iterable)
+          print("Successfully loaded HF weights into the model using vLLM's standard model.load_weights API.")
+      except Exception as e:
+          print(f"FAILED TO LOAD WEIGHTS VIA vLLM API: {e}")
+          import traceback
+          traceback.print_exc()
+          import sys
+          sys.exit(1)
           
       print("Finished HF dict assignment.")
+      
+      import gc
+      if 'maxtext_vllm_state' in locals():
+          del maxtext_vllm_state
+      if 'model_state' in locals():
+          del model_state
+      gc.collect()
 
   # --- Generation test ------------------------------------------------------
   sampling_params = SamplingParams(
@@ -540,7 +593,7 @@ def validate_converter(argv) -> None:
     try:
         print(llm.generate(prompt_text, sampling_params=sampling_params, use_tqdm=False))
     except Exception as e:
-        print(f"Expected crash during generation test due to XLA co-tenancy: {e}")
+        print(f"Error: crash during generation test due to XLA co-tenancy: {e}")
 
 
 def main(argv: Sequence[str]) -> None:
