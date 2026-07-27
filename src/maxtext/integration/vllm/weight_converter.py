@@ -1,7 +1,8 @@
 import abc
 import re
 import jax
-import jax.numpy as jnp
+import jax.numpy as jax_np
+import numpy as jnp
 import gc
 from typing import List, Union, Any, Dict
 from flax import traverse_util
@@ -281,7 +282,8 @@ class WeightConverter(abc.ABC):
                 if len(matched_items) == len(rule.source_patterns):
                     # Sort by index i to pass tensors in the correct order
                     matched_items.sort(key=lambda x: x[0])
-                    tensors = [x[1].value if hasattr(x[1], "value") else x[1] for x in matched_items]
+                    import numpy as np
+                    tensors = [np.asarray(x[1].value) if hasattr(x[1], "value") else np.asarray(x[1]) for x in matched_items]
                     
                     # Apply operations
                     result = tensors
