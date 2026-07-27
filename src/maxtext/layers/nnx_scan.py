@@ -111,6 +111,13 @@ def apply_scanned_layers(
 
   Externally managed per-layer state, such as KV caches, is not supported by
   this scan path.
+
+  Note:
+    This is a minimal, model-agnostic scan primitive. The other NNX decoder
+    paths instead go through ``NNXDecoder._apply_layers_sequentially``, a heavier
+    applier that also threads external (vLLM) KV caches via a static unroll and
+    re-applies scan-axis metadata. Gemma4 is currently the only caller of this
+    function; unifying the two appliers is a follow-up cleanup.
   """
   if length <= 0:
     return carry

@@ -455,10 +455,18 @@ class Gemma4ScannableBlock(nnx.Module):
     if not 0 <= num_of_layers <= pattern_length:
       raise ValueError(f"Gemma4ScannableBlock must contain between 0 and {pattern_length} layers; got {num_of_layers}.")
 
-    # Pattern is 5 local, 1 global.
-    self.num_local = min(5, num_of_layers)
-    self.num_global = max(0, num_of_layers - 5)
+    # The block runs its local (sliding-window) layers first, then a single
+    # global layer, matching GEMMA4_ATTENTION_PATTERN. Derive the per-type
+    # counts from the pattern (well, its first num_of_layers entries) rather
+    # than hardcoding the 5-local / 1-global split.
+    active_pattern = GEMMA4_ATTENTION_PATTERN[:num_of_layers]
+    self.num_local = sum(1 for attn_type in active_pattern if attn_type == AttentionType.LOCAL_SLIDING)
+    self.num_global = sum(1 for attn_type in active_pattern if attn_type == AttentionType.GLOBAL)
 
+    # num_of_layers can be 0: the decoders always construct a "remainder" block
+    # for num_decoder_layers % pattern_length layers, which is 0 whenever the
+    # layer count divides evenly (e.g. 31b = 60 layers). That block is built but
+    # never applied, so num_local or num_global may legitimately be 0 here.
     if self.num_local > 0:
       self.local_layers = nnx_scan.create_scanned_layers(
           lambda layer_rngs: Gemma4DecoderLayer(
@@ -491,52 +499,133 @@ class Gemma4ScannableBlock(nnx.Module):
     else:
       self.global_layer = None
 
-  def _apply_local_layers(
-      self,
-      y,
-      decoder_segment_ids,
-      decoder_positions,
-      deterministic,
-      model_mode,
-      slot=None,
-      previous_chunk=None,
-      bidirectional_mask=None,
-      attention_metadata=None,
-  ):
-    """Applies the block's local-attention layers via a per-layer rematerialized scan."""
+  def _run_layer(self, layer, y, layer_kwargs, kv_cache=None):
+    """Invokes one ``Gemma4DecoderLayer``, returning ``(output, updated_kv_cache)``.
 
-    def apply_layer(layer, carry):
-      layer_out = layer(
-          carry,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          slot=slot,
-          previous_chunk=previous_chunk,
-          bidirectional_mask=bidirectional_mask,
-          attention_metadata=attention_metadata,
-      )
-      return layer_out[0] if isinstance(layer_out, tuple) else layer_out
+    This is the shared leaf used by the local scan, the global length-1 scan,
+    and the external kv-cache unroll, so it runs in every mode (train / prefill
+    / autoregressive). ``updated_kv_cache`` is ``None`` when the layer emits a bare
+    output rather than an ``(output, kv_cache)`` tuple.
+    """
+    out = layer(y, **layer_kwargs, kv_cache=kv_cache)
+    return out if isinstance(out, tuple) else (out, None)
 
-    apply_remat = self.apply_internal_remat and self.config.remat_policy != "none"
-    if apply_remat:
-      prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-      remat_policy = self.remat_policy_fn
-    else:
-      prevent_cse = True
-      remat_policy = None
+  @property
+  def _remat_enabled(self):
+    """Whether the block rematerializes its own layers.
 
+    False when the caller applies block-level remat instead
+    (``apply_internal_remat=False``) or when remat is disabled
+    (``remat_policy == "none"``). Note that ``remat_policy_fn`` 
+    is ``None`` for both ``"none"`` and ``"full"``, so it
+    cannot distinguish "no remat" from "full remat" on its own.
+    """
+    return self.apply_internal_remat and self.config.remat_policy != "none"
+
+  def _scan_local_layers(self, y, layer_kwargs):
+    """Runs the local (sliding-window) layers via a per-layer rematerialized ``jax.lax.scan``."""
+    remat = self._remat_enabled
     return nnx_scan.apply_scanned_layers(
         self.local_layers,
         y,
         length=self.num_local,
         param_scan_axis=self.config.param_scan_axis,
-        apply_fn=apply_layer,
-        remat=apply_remat,
-        remat_policy=remat_policy,
-        prevent_cse=prevent_cse,
+        apply_fn=lambda layer, carry: self._run_layer(layer, carry, layer_kwargs)[0],
+        remat=remat,
+        remat_policy=self.remat_policy_fn if remat else None,
+        # prevent_cse is only consulted by jax.checkpoint, i.e. when remat=True;
+        # its value is irrelevant otherwise.
+        prevent_cse=maxtext_utils.should_prevent_cse_in_remat(self.config) if remat else True,
     )
+
+  def _scan_global_layer(self, y, layer_kwargs):
+    """Runs the single global-attention layer inside a length-1 ``jax.lax.scan``.
+
+    The length-1 scan is guarded by a trip-count-one while boundary and wraps
+    the layer in its own ``jax.checkpoint``, which keeps only one layer's
+    full-sequence-attention working set live at a time; without the boundary
+    (blocks are unrolled) XLA co-schedules every block's backward working set
+    and OOMs.
+    """
+    cfg = self.config
+    graphdef_g, state_g = nnx.split(self.global_layer)
+
+    def run_global_layer(carry, _):
+      current_y, current_state = carry
+      layer = nnx.merge(graphdef_g, current_state)
+      new_y = self._run_layer(layer, current_y, layer_kwargs)[0]
+      return (new_y, nnx.state(layer)), None
+
+    # Offloaded (pinned-host) residuals can't cross the trip-count-one boundary,
+    # so save would-be-offloaded tensors on device for the global layer instead;
+    # the local-layer scan (a real multi-iteration scan) still offloads.
+    global_remat_policy = self.remat_policy_fn
+    offload_names = maxtext_utils.get_save_and_offload_names(cfg)
+    if offload_names[0] or offload_names[1]:
+      save_names, offload_to_device = offload_names
+      global_remat_policy = jax.checkpoint_policies.save_only_these_names(*(save_names + offload_to_device))
+
+    if self._remat_enabled:
+      prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
+      run_global_layer = jax.checkpoint(
+          run_global_layer,
+          policy=global_remat_policy,
+          prevent_cse=prevent_cse,
+      )
+
+    # Carry state through the loop instead of returning a stacked [1, ...] scan
+    # result: slicing that result previously introduced a bitcast between device
+    # and pinned-host memory under offload remat.
+    with xla_metadata.set_xla_metadata(**{"skip-simplify-while-loops_trip-count-one": "true"}):
+      (y, global_state), _ = jax.lax.scan(
+          run_global_layer,
+          (y, state_g),
+          xs=None,
+          length=1,
+      )
+
+    nnx.update(self.global_layer, global_state)
+    return y
+
+  def _forward_with_external_kv_cache(self, y, kv_cache, layer_kwargs):
+    """Runs the block with externally-supplied per-layer kv caches (vLLM PagedAttention).
+
+    Scanning would stack the kv-cache list, which copies it and breaks the
+    in-place PagedAttention updates, so the layers are unrolled statically. The
+    block's ``kv_cache`` is a per-layer list: the first ``num_local`` entries
+    feed the local layers, followed by the single global layer. Returns
+    ``(y, updated_kvs)`` with one updated cache per layer.
+    """
+    updated_kvs = []
+
+    if self.local_layers is not None:
+      # Slice the scanned local stack per layer, run it, collect the updated kv
+      # caches, and re-stack the per-layer state.
+      graphdef, params, state = nnx.split(self.local_layers, nnx.Param, ...)
+      scan_axis = self.config.param_scan_axis
+      if scan_axis != 0:
+        params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
+      per_layer_states = []
+      for i in range(self.num_local):
+        current_params = jax.tree.map(lambda x, i=i: x[i], params)
+        current_state = jax.tree.map(lambda x, i=i: x[i], state)
+        layer = nnx.merge(graphdef, current_params, current_state)
+        y, new_kv = self._run_layer(layer, y, layer_kwargs, kv_cache[i])
+        updated_kvs.append(new_kv)
+        per_layer_states.append(nnx.state(layer))
+
+      stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs), *per_layer_states)
+      if scan_axis != 0:
+        stacked_params, stacked_other = stacked_state.split(nnx.Param, ...)
+        stacked_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), stacked_params)
+        stacked_state = nnx.State.merge(stacked_params, stacked_other)
+      nnx.update(self.local_layers, stacked_state)
+
+    if self.global_layer is not None:
+      y, new_kv = self._run_layer(self.global_layer, y, layer_kwargs, kv_cache[self.num_local])
+      updated_kvs.append(new_kv)
+
+    return y, tuple(updated_kvs)
 
   def __call__(
       self,
@@ -555,130 +644,36 @@ class Gemma4ScannableBlock(nnx.Module):
     cfg = self.config
     inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
     inputs = checkpoint_name(inputs, "decoder_layer_input")
+
+    # Arguments shared by every layer in the block. model_mode differentiates
+    # train / prefill / autoregressive inside each layer; the block itself does
+    # not branch on it.
+    layer_kwargs = dict(
+        decoder_segment_ids=decoder_segment_ids,
+        decoder_positions=decoder_positions,
+        deterministic=deterministic,
+        model_mode=model_mode,
+        slot=slot,
+        previous_chunk=previous_chunk,
+        bidirectional_mask=bidirectional_mask,
+        attention_metadata=attention_metadata,
+    )
+
+    # Externally-supplied per-layer caches (vLLM PagedAttention) force a static
+    # unroll; otherwise attention manages its own cache and we take the scanned
+    # path (train and standard prefill/autoregressive alike).
+    if kv_cache is not None:
+      return self._forward_with_external_kv_cache(inputs, kv_cache, layer_kwargs)
+
     y = inputs
-
-    updated_kvs = []
-
-    if kv_cache is not None:
-      # External per-layer KV caches require statically slicing the scanned local layers.
-      if self.local_layers is not None:
-        graphdef, params, state = nnx.split(self.local_layers, nnx.Param, ...)
-        scan_axis = self.config.param_scan_axis
-        if scan_axis != 0:
-          params = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), params)
-        per_layer_states = []
-        for i in range(self.num_local):
-          current_params = jax.tree.map(lambda x, i=i: x[i], params)
-          current_state = jax.tree.map(lambda x, i=i: x[i], state)
-          layer = nnx.merge(graphdef, current_params, current_state)
-          y, new_kv = layer(
-              y,
-              decoder_segment_ids,
-              decoder_positions,
-              deterministic,
-              model_mode,
-              slot=slot,
-              previous_chunk=previous_chunk,
-              bidirectional_mask=bidirectional_mask,
-              kv_cache=kv_cache[i],
-              attention_metadata=attention_metadata,
-          )
-          updated_kvs.append(new_kv)
-          per_layer_states.append(nnx.state(layer))
-
-        stacked_state = jax.tree.map(lambda *xs: jnp.stack(xs), *per_layer_states)
-        if scan_axis != 0:
-          stacked_params, stacked_other = stacked_state.split(nnx.Param, ...)
-          stacked_params = jax.tree.map(lambda x: jnp.moveaxis(x, 0, scan_axis), stacked_params)
-          stacked_state = nnx.State.merge(stacked_params, stacked_other)
-        nnx.update(self.local_layers, stacked_state)
-    elif self.local_layers is not None:
-      y = self._apply_local_layers(
-          y,
-          decoder_segment_ids,
-          decoder_positions,
-          deterministic,
-          model_mode,
-          slot=slot,
-          previous_chunk=previous_chunk,
-          bidirectional_mask=bidirectional_mask,
-          attention_metadata=attention_metadata,
-      )
-
+    if self.local_layers is not None:
+      y = self._scan_local_layers(y, layer_kwargs)
     if self.global_layer is not None:
-      if kv_cache is not None:
-        y, new_kv = self.global_layer(
-            y,
-            decoder_segment_ids,
-            decoder_positions,
-            deterministic,
-            model_mode,
-            previous_chunk=previous_chunk,
-            slot=slot,
-            bidirectional_mask=bidirectional_mask,
-            kv_cache=kv_cache[self.num_local],
-            attention_metadata=attention_metadata,
-        )
-        updated_kvs.append(new_kv)
-      else:
-        graphdef_g, state_g = nnx.split(self.global_layer)
+      y = self._scan_global_layer(y, layer_kwargs)
 
-        def scan_global_layer(carry, _):
-          current_y, current_state = carry
-          layer = nnx.merge(graphdef_g, current_state)
-          layer_out = layer(
-              current_y,
-              decoder_segment_ids,
-              decoder_positions,
-              deterministic,
-              model_mode,
-              previous_chunk=previous_chunk,
-              slot=slot,
-              bidirectional_mask=bidirectional_mask,
-              attention_metadata=attention_metadata,
-          )
-          new_y = layer_out[0] if isinstance(layer_out, tuple) else layer_out
-          return (new_y, nnx.state(layer)), None
-
-        # Remat the global layer behind the trip-count-one while boundary below,
-        # which keeps only one layer's full-sequence-attention activations live;
-        # without it (blocks are unrolled) XLA co-schedules every block's backward
-        # working set and OOMs. Offloaded (pinned-host) residuals can't cross that
-        # boundary, so the global layer saves would-be-offloaded tensors on device
-        # instead; the local-layer scan (a real multi-iteration scan) still offloads.
-        global_remat_policy = self.remat_policy_fn
-        offload_names = maxtext_utils.get_save_and_offload_names(cfg)
-        if offload_names[0] or offload_names[1]:
-          save_names, offload_to_device = offload_names
-          global_remat_policy = jax.checkpoint_policies.save_only_these_names(*(save_names + offload_to_device))
-
-        if self.apply_internal_remat and self.config.remat_policy != "none":
-          prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
-          scan_global_layer = jax.checkpoint(
-              scan_global_layer,
-              policy=global_remat_policy,
-              prevent_cse=prevent_cse,
-          )
-
-        # Carry state through the loop instead of returning a stacked [1, ...]
-        # scan result: slicing that result previously introduced a bitcast
-        # between device and pinned-host memory under offload remat.
-        with xla_metadata.set_xla_metadata(**{"skip-simplify-while-loops_trip-count-one": "true"}):
-          (y, global_state), _ = jax.lax.scan(
-              scan_global_layer,
-              (y, state_g),
-              xs=None,
-              length=1,
-          )
-
-        nnx.update(self.global_layer, global_state)
-
-    if kv_cache is not None:
-      return y, tuple(updated_kvs)
-    elif cfg.scan_layers:
+    if cfg.scan_layers:
       return y, None
-    else:
-      return y
+    return y
 
 
 Gemma4ScannableBlockToLinen = nnx_wrappers.to_linen_class(

@@ -893,6 +893,11 @@ class NNXDecoder(nnx.Module):
   ):
     """Runs the layer stack using nnx.scan.
 
+    This is the fuller of the two NNX scan appliers: it also threads external
+    (vLLM) KV caches via a static unroll and re-applies scan-axis metadata.
+    ``nnx_scan.apply_scanned_layers`` is a leaner, model-agnostic alternative
+    (currently used only by Gemma4); unifying the two is a follow-up cleanup.
+
     Args:
       layers: The stacked NNX module whose params are scanned over.
       x_in: The carry (hidden state) fed into the first layer.
