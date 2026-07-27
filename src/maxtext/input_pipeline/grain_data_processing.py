@@ -16,6 +16,8 @@
 
 import math
 import glob
+import os
+import re
 from pathlib import Path
 import functools
 import ml_collections
@@ -34,6 +36,39 @@ from maxtext.input_pipeline import dpo_utils
 from maxtext.input_pipeline import multihost_dataloading
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
+
+
+def construct_hf_dataset_path(
+    hf_path: str,
+    hf_train_files: str = None,
+    split: str = "train"
+) -> str:
+    """
+    Constructs a robust Hugging Face fsspec (hf://) path for dataset loading.
+    """
+    hf_path = hf_path.strip().strip("/")
+    
+    scheme_prefix = "hf://"
+    if hf_path.startswith("hf://"):
+        hf_path = hf_path[len("hf://"):]
+        
+    if not hf_path.startswith("datasets/"):
+        hf_path = f"datasets/{hf_path}"
+        
+    match = re.match(r"^([^@]+)(@.+)?$", hf_path)
+    repo_path = match.group(1) if match else hf_path
+    revision_suffix = match.group(2) if match and match.group(2) else ""
+    
+    if hf_train_files:
+        file_pattern = hf_train_files.lstrip("/")
+    else:
+        if split:
+            file_pattern = f"**/*{split}*.parquet"
+        else:
+            file_pattern = "**/*.parquet"
+            
+    full_path = f"{scheme_prefix}{repo_path}{revision_suffix}/{file_pattern}"
+    return full_path
 
 
 def find_data_files(data_file_pattern, hf_access_token=None):
@@ -442,10 +477,7 @@ def make_grain_train_iterator(
 
   grain_train_files = config.grain_train_files
   if not grain_train_files and not config.grain_train_mixture_config_path and config.hf_path:
-    hf_path = config.hf_path
-    if not hf_path.startswith("datasets/"):
-      hf_path = f"datasets/{hf_path}"
-    grain_train_files = f"hf://{hf_path}/**/*.parquet"
+    grain_train_files = construct_hf_dataset_path(config.hf_path, split="train")
 
   get_ds_fn = functools.partial(
       get_datasets,
@@ -549,9 +581,14 @@ def make_grain_eval_iterator(
 
   pipeline_fn = _get_pipeline_fn(config)
 
+  grain_eval_files = config.grain_eval_files
+  if not grain_eval_files and getattr(config, "hf_path", None):
+    split = getattr(config, "hf_eval_split", None) or "validation"
+    grain_eval_files = construct_hf_dataset_path(config.hf_path, split=split)
+
   get_ds_fn = functools.partial(
       get_datasets,
-      config.grain_eval_files,
+      grain_eval_files,
       config.grain_file_type,
       shuffle=False,  # No shuffle for eval
       shuffle_seed=config.data_shuffle_seed,
