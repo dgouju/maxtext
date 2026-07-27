@@ -563,6 +563,19 @@ def validate_converter(argv) -> None:
               return torch.from_numpy(arr_np)
           hf_weights_iterable = [(k, convert_to_pt(v)) for k, v in hf_weights_iterable]
           
+          import gc
+          if 'maxtext_vllm_state' in locals():
+              del maxtext_vllm_state
+          if 'model_state' in locals():
+              # Aggressively delete the 60GB source TPU parameters before vLLM loads
+              for arr in jax.tree_util.tree_leaves(model_state):
+                  arr_true = arr.value if hasattr(arr, "value") else arr
+                  if hasattr(arr_true, "delete"):
+                      arr_true.delete()
+              del model_state
+          gc.collect()
+          jax.clear_caches()
+          
           llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(hf_weights_iterable)
           print("Successfully loaded HF weights into the model using vLLM's standard model.load_weights API.")
       except Exception as e:
@@ -573,13 +586,6 @@ def validate_converter(argv) -> None:
           sys.exit(1)
           
       print("Finished HF dict assignment.")
-      
-      import gc
-      if 'maxtext_vllm_state' in locals():
-          del maxtext_vllm_state
-      if 'model_state' in locals():
-          del model_state
-      gc.collect()
 
   # --- Generation test ------------------------------------------------------
   sampling_params = SamplingParams(
