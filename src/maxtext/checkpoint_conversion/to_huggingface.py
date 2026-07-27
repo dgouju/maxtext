@@ -99,6 +99,7 @@ from maxtext.utils import max_utils
 from maxtext.utils.globals import HF_IDS
 from maxtext.utils.lora_utils import sync_lora_metadata
 from maxtext.utils.model_creation_utils import verify_and_sync_scan_layers
+from maxtext.checkpoint_conversion.to_maxtext import get_key_mapper
 
 
 flags.DEFINE_bool(
@@ -385,10 +386,15 @@ def _transform_weights_to_adapter(param_map, state_dict):
 
 def _transform_weights_to_full_model(config, filtered_map_keys, state_dict, param_map, hook_fn_map, shape_map):
   """Transforms MaxText weights to HF full model format, with optional LoRA merging."""
+  import gc
   processed_params_list = []
   lora_scaling = config.lora.lora_alpha / config.lora.lora_rank if config.lora.lora_rank > 0 else 1.0
   for key in MemoryMonitorTqdm(filtered_map_keys, leave=True):
-    weight = [state_dict[subkey] for subkey in key] if isinstance(key, tuple) else state_dict.get(key)
+    if isinstance(key, tuple):
+      weight = [state_dict.pop(subkey, None) for subkey in key]
+    else:
+      weight = state_dict.pop(key, None)
+
     if weight is not None and not isinstance(key, tuple):
       delta = _get_lora_delta(key, state_dict, lora_scaling)
       if delta is not None:
@@ -397,6 +403,7 @@ def _transform_weights_to_full_model(config, filtered_map_keys, state_dict, para
         weight = (jnp.asarray(weight, dtype=jnp.float32) + delta).astype(weight.dtype)
     if weight is not None:
       processed_params_list.extend(process_maxtext_param(key, weight, param_map, hook_fn_map, shape_map, config))
+      gc.collect()
   return dict(processed_params_list)
 
 
@@ -429,6 +436,9 @@ def _transform_and_save_weights(
 
     if not transformed_hf_weights:
       raise ValueError("Error: No weights were transformed. Check mappings and parameter paths.")
+      
+    key_mapper = get_key_mapper(config.model_name)
+    transformed_hf_weights = {key_mapper(k): v for k, v in transformed_hf_weights.items()}
 
     max_logging.log("\nSaving HuggingFace model...")
     save_model_files(transformed_hf_weights, hf_config_obj, tokenizer, processor, output_directory)
@@ -483,7 +493,12 @@ def main(argv: Sequence[str]) -> None:
   if not config.base_output_directory:
     output_directory = f"tmp/{config.run_name}"
   else:
-    output_directory = config.base_output_directory
+    output_directory = os.path.expanduser(config.base_output_directory)
+    if output_directory.startswith("/usr/local/google/home/"):
+      # Remap workstation home path to remote VM home path if running remotely
+      user = os.path.basename(output_directory.split("/usr/local/google/home/")[1].split("/")[0])
+      local_prefix = f"/usr/local/google/home/{user}"
+      output_directory = output_directory.replace(local_prefix, os.path.expanduser("~"))
 
   # 1. Get HuggingFace Model Configuration
   model_key = config.model_name
