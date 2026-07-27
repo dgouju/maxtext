@@ -3767,6 +3767,8 @@ class RLConfig(
     # Debugging and Profiling
     DevelopmentAndDebugging,
     Profiling,
+    # Engram conditional/sparse memory layers config attributes (e.g. engram_layers) accessed during RL evaluation
+    Engram,
     # For compatibility with trainer in post_train/rl
     RL,
     RLCluster,
