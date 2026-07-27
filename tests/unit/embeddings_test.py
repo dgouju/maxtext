@@ -227,6 +227,42 @@ class YarnRotaryEmbeddingTest(unittest.TestCase):
           rngs=self.rngs,
       )
 
+  def test_non_interleaved_call(self):
+    layer = embeddings.YarnRotaryEmbedding(
+        embedding_dims=4,
+        mesh=self.mesh,
+        max_position_embeddings=16384,
+        original_max_position_embeddings=4096,
+        interleave=False,
+        rngs=self.rngs,
+    )
+    inputs = jnp.ones((1, 2, 1, 4))
+    position = jnp.array([[0, 1]])
+    outputs = layer(inputs, position=position)
+    self.assertEqual(outputs.shape, (1, 2, 1, 4))
+
+    # For all-ones input, the output of non-interleaved RoPE matches interleaved RoPE
+    expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 0.996094, 1.38281, 1.00781]]]])
+    np.testing.assert_allclose(outputs, expected, atol=1e-5)
+
+  def test_explicit_shard_mode_call(self):
+    layer = embeddings.YarnRotaryEmbedding(
+        embedding_dims=4,
+        mesh=self.mesh,
+        max_position_embeddings=16384,
+        original_max_position_embeddings=4096,
+        shard_mode=maxtext_utils.ShardMode.EXPLICIT,
+        rngs=self.rngs,
+    )
+    inputs = jnp.ones((1, 2, 1, 4))
+    position = jnp.array([[0, 1]])
+    outputs = layer(inputs, position=position)
+    self.assertEqual(outputs.shape, (1, 2, 1, 4))
+
+    # Output should match default
+    expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 0.996094, 1.38281, 1.00781]]]])
+    np.testing.assert_allclose(outputs, expected, atol=1e-5)
+
 
 if __name__ == "__main__":
   unittest.main()
