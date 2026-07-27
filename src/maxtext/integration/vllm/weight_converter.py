@@ -282,8 +282,10 @@ class WeightConverter(abc.ABC):
                 if len(matched_items) == len(rule.source_patterns):
                     # Sort by index i to pass tensors in the correct order
                     matched_items.sort(key=lambda x: x[0])
-                    import numpy as np
-                    tensors = [np.asarray(x[1].value) if hasattr(x[1], "value") else np.asarray(x[1]) for x in matched_items]
+                    tensors = [x[1].value if hasattr(x[1], "value") else x[1] for x in matched_items]
+                    if len(rule.operations) > 0 or target_state is None:
+                        import numpy as np
+                        tensors = [np.asarray(t) for t in tensors]
                     
                     # Apply operations
                     result = tensors
