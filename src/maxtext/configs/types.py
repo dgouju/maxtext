@@ -1806,6 +1806,16 @@ class YarnRope(BaseModel):
       False,
       description="Scale the rotary embedding output. Used by some models like gpt-oss.",
   )
+  rope_pairwise: bool = Field(
+      False,
+      description="Keep rank-5 pair tensor intact and return interleaved RoPE.",
+  )
+
+  @model_validator(mode="after")
+  def validate_rope_pairwise(self) -> "Rope":
+    if self.rope_pairwise and not self.rope_interleave:
+      raise ValueError("rope_pairwise=True requires rope_interleave=True.")
+    return self
 
 
 class InferenceGeneral(BaseModel):

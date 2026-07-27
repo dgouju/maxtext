@@ -197,6 +197,36 @@ class YarnRotaryEmbeddingTest(unittest.TestCase):
     expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 0.996094, 1.38281, 1.00781]]]])
     np.testing.assert_allclose(outputs, expected, atol=1e-5)
 
+  def test_pairwise_call(self):
+    layer = embeddings.YarnRotaryEmbedding(
+        embedding_dims=4,
+        mesh=self.mesh,
+        max_position_embeddings=16384,
+        original_max_position_embeddings=4096,
+        pairwise=True,
+        rngs=self.rngs,
+    )
+    inputs = jnp.ones((1, 2, 1, 4))
+    position = jnp.array([[0, 1]])
+    outputs = layer(inputs, position=position)
+    self.assertEqual(outputs.shape, (1, 2, 1, 4))
+
+    # Output with pairwise=True should match default interleaved YaRN RoPE
+    expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 0.996094, 1.38281, 1.00781]]]])
+    np.testing.assert_allclose(outputs, expected, atol=1e-5)
+
+  def test_pairwise_requires_interleave(self):
+    with self.assertRaises(ValueError):
+      embeddings.YarnRotaryEmbedding(
+          embedding_dims=4,
+          mesh=self.mesh,
+          max_position_embeddings=16384,
+          original_max_position_embeddings=4096,
+          interleave=False,
+          pairwise=True,
+          rngs=self.rngs,
+      )
+
 
 if __name__ == "__main__":
   unittest.main()
