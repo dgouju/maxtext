@@ -304,6 +304,14 @@ python3 -m tests.utils.forward_pass_logit_checker \
 
 To run MMLU benchmarks and validate the model's performance, follow the instructions provided [here](https://github.com/AI-Hypercomputer/maxtext/blob/main/benchmarks/api_server/README.md).
 
+## YaRN RoPE Optimization
+
+To optimize YaRN Rotary Position Embedding (RoPE) performance, you can enable pairwise RoPE.
+
+*   **Flag**: `rope_pairwise` (default: `False`)
+*   **Description**: When set to `True`, it keeps the rank-5 pair tensor intact and returns interleaved RoPE, avoiding complex number creation and some tensor reshaping.
+*   **Constraint**: `rope_pairwise=True` requires `rope_interleave=True`.
+
 ## Supported MoE strategy
 * Dropless
   * [MegaBlocks](https://arxiv.org/abs/2211.15841) implementation with flag `sparse_matmul=True megablox=True`.
