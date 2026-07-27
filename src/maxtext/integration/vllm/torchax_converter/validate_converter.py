@@ -573,6 +573,15 @@ def validate_converter(argv) -> None:
                   if hasattr(arr_true, "delete"):
                       arr_true.delete()
               del model_state
+              
+          if 'golden_llm_state' in locals():
+              print("Deleting vLLM dummy arrays to free up JAX memory pool space...")
+              for arr in jax.tree_util.tree_leaves(golden_llm_state):
+                  arr_true = arr.value if hasattr(arr, "value") else arr
+                  if hasattr(arr_true, "delete"):
+                      try: arr_true.delete()
+                      except: pass
+                      
           gc.collect()
           jax.clear_caches()
           
