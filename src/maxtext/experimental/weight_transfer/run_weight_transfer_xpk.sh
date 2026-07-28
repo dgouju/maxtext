@@ -27,9 +27,9 @@ DEVICE_TYPE="${DEVICE_TYPE:-v5p-8}"
 NUM_SLICES="${NUM_SLICES:-2}"
 WORKLOAD_NAME="${WORKLOAD_NAME:-weight-transfer-$(date +%Y%m%d-%H%M%S)}"
 
-WEIGHT_SIZE_MB="${WEIGHT_SIZE_MB:-1024}"
+WEIGHT_SIZE_MB="${WEIGHT_SIZE_MB:-512}"
 NUM_LAYERS="${NUM_LAYERS:-12}"
-ITERATIONS="${ITERATIONS:-10}"
+ITERATIONS="${ITERATIONS:-5}"
 PROFILE_DIR="${PROFILE_DIR:-}"
 USE_BASE_DOCKER_IMAGE="${USE_BASE_DOCKER_IMAGE:-}"
 SCRIPT_DIR="${SCRIPT_DIR:-/usr/local/google/home/mohitkhatwani/maxtext}"
@@ -231,7 +231,7 @@ if [ -n "${RESERVATION}" ]; then
 fi
 
 # Construct command to run inside container
-COMMAND="export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python PYTHONUNBUFFERED=1 && JOB_NAME=\${JOBSET_NAME:-${WORKLOAD_NAME}} && SRC_HOST=\$(hostname -I | awk '{print \$1}') && DST_HOST=\$(getent hosts \${JOB_NAME}-slice-job-1-0.\${JOB_NAME} | awk '{print \$1}') && PYTHONPATH=/app/src:/app:\$PYTHONPATH python3 -u /app/src/maxtext/experimental/weight_transfer/transfer_weights_raiden.py --weight_size_mb=${WEIGHT_SIZE_MB} --num_layers=${NUM_LAYERS} --iterations=${ITERATIONS} --dest_port=29500 --source_ip=\${SRC_HOST:-\"0.0.0.0\"} --dest_ip=\${DST_HOST:-\"127.0.0.1\"}"
+COMMAND="export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python PYTHONUNBUFFERED=1 && JOB_NAME=\${JOBSET_NAME:-${WORKLOAD_NAME}} && SRC_HOST=\$(getent hosts \${JOB_NAME}-slice-job-0-0.\${JOB_NAME} | awk '{print \$1}') && DST_HOST=\$(getent hosts \${JOB_NAME}-slice-job-1-0.\${JOB_NAME} | awk '{print \$1}') && PYTHONPATH=/app/src:/app:\$PYTHONPATH python3 -u /app/src/maxtext/experimental/weight_transfer/transfer_weights_raiden.py --weight_size_mb=${WEIGHT_SIZE_MB} --num_layers=${NUM_LAYERS} --iterations=${ITERATIONS} --dest_port=29500 --source_ip=\${SRC_HOST:-\"0.0.0.0\"} --dest_ip=\${DST_HOST:-\"127.0.0.1\"}"
 
 if [ -n "${PROFILE_DIR}" ]; then
   COMMAND="${COMMAND} --profile_dir=${PROFILE_DIR}"

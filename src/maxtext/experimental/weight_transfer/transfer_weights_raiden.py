@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import socket
+import threading
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -31,7 +33,6 @@ if "XLA_FLAGS" not in os.environ:
   os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import jax
-from jax.experimental import multihost_utils
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
@@ -156,22 +157,19 @@ def calculate_layer_dimensions(target_total_bytes: int, num_layers: int) -> Tupl
   return hidden_dim, max(16, intermediate_dim)
 
 
-def create_synthetic_weights(num_layers: int, total_size_mb: int, mesh: Mesh, sharding_spec: P) -> Dict[str, Any]:
-  """Generates synthetic Transformer model weight PyTrees matching MaxText conventions."""
+def create_synthetic_weights(num_layers: int, total_size_mb: int, mesh: Mesh, sharding_spec: P) -> List[jax.Array]:
+  """Generates a simple list of sharded JAX 2D arrays."""
   total_bytes = total_size_mb * 1024 * 1024
   dim0, dim1 = calculate_layer_dimensions(total_bytes, num_layers)
 
   sharding = NamedSharding(mesh, sharding_spec)
-  weights = {}
+  arrays = []
 
   for i in range(num_layers):
-    layer_name = f"layer_{i}"
     raw_array = jnp.ones((dim0, dim1), dtype=jnp.float32) * (i + 1.0)
     sharded_array = jax.device_put(raw_array, sharding)
-    weights[layer_name] = {
-        "kernel": sharded_array,
-    }
-  return weights
+    arrays.append(sharded_array)
+  return arrays
 
 
 def get_dst_sharding_for_array(arr: jax.Array, dst_mesh: Mesh, dst_sharding_spec: P) -> NamedSharding:
@@ -201,7 +199,13 @@ def build_resharding_start_request(
       except Exception:  # pylint: disable=broad-exception-caught
         continue
 
+      if not chunks:
+        continue
+
       has_reshard = True
+      unit = start_req.src_units.add()
+      unit.data_name = str(idx)
+
       src_devices = src_sharding.mesh.devices.flatten()
       dst_devices = dst_sharding.mesh.devices.flatten()
 
@@ -217,12 +221,11 @@ def build_resharding_start_request(
         _, src_col_slice = src_map[src_dev]
         _, dst_col_slice = dst_map[dst_dev]
 
-        src_cols = (
-            (src_col_slice.stop - src_col_slice.start) if src_col_slice.stop and src_col_slice.start else global_shape[1]
-        )
-        dst_cols = (
-            (dst_col_slice.stop - dst_col_slice.start) if dst_col_slice.stop and dst_col_slice.start else global_shape[1]
-        )
+        has_src_cols = src_col_slice.stop is not None and src_col_slice.start is not None
+        src_cols = (src_col_slice.stop - src_col_slice.start) if has_src_cols else global_shape[1]
+
+        has_dst_cols = dst_col_slice.stop is not None and dst_col_slice.start is not None
+        dst_cols = (dst_col_slice.stop - dst_col_slice.start) if has_dst_cols else global_shape[1]
 
         r_start, _, c_start, _ = chunk.src_slice
         d_r_start, _, d_c_start, _ = chunk.dst_slice
@@ -234,6 +237,8 @@ def build_resharding_start_request(
         entry.dst_shard_idx = chunk.dst_device_id
         entry.src_block_id = idx
         entry.dst_block_id = idx
+        if hasattr(entry, "layer_idx"):
+          entry.layer_idx = idx
         entry.src_offset_bytes = (r_start * src_cols + c_start) * itemsize
         entry.dst_offset_bytes = (d_r_start * dst_cols + d_c_start) * itemsize
         entry.size_bytes = c_cols * itemsize
@@ -299,15 +304,110 @@ def trigger_raiden_transfer(
     raise RuntimeError(f"Raiden transfer trigger failed: {resp.message}")
 
 
+def send_completion_ack(dest_ip: str, port: int):
+  """Sends a lightweight TCP completion ACK to the sender host."""
+  try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+      s.settimeout(10.0)
+      s.connect((dest_ip, port))
+      s.sendall(b"ACK")
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    print(f"Warning: Failed to send completion ACK to {dest_ip}:{port}: {e}", flush=True)
+
+
+class PersistentACKServer:
+  """Single persistent TCP ACK server listening on a single port across all iterations."""
+
+  def __init__(self, port: int):
+    self.port = port
+    self.queue = queue.Queue()
+    self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    self.sock.bind(("0.0.0.0", port))
+    self.sock.listen(128)
+    self.running = True
+    self.thread = threading.Thread(target=self._listen, daemon=True)
+    self.thread.start()
+
+  def _listen(self):
+    """Background worker loop accepting TCP ACK connections."""
+    while self.running:
+      try:
+        self.sock.settimeout(1.0)
+        conn, _ = self.sock.accept()
+        with conn:
+          conn.recv(1024)
+        self.queue.put(True)
+      except socket.timeout:
+        continue
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        if self.running:
+          print(f"Warning: ACK server error on port {self.port}: {e}", flush=True)
+
+  def wait_for_ack(self, timeout: float = 120.0) -> bool:
+    try:
+      return self.queue.get(timeout=timeout)
+    except queue.Empty:
+      print(f"Warning: Timed out waiting for completion ACK on port {self.port}", flush=True)
+      return False
+
+  def stop(self):
+    self.running = False
+    try:
+      self.sock.close()
+    except Exception:  # pylint: disable=broad-exception-caught
+      pass
+
+
+def wait_for_port(ip: str, port: int, timeout: float = 60.0) -> bool:
+  """Waits until the destination port is open and listening."""
+  t0 = time.time()
+  print(f"  [wait_for_port] Waiting for {ip}:{port} to be ready...", flush=True)
+  while time.time() - t0 < timeout:
+    try:
+      with socket.create_connection((ip, port), timeout=1.0):
+        print(f"  [wait_for_port] Destination {ip}:{port} is open and ready!", flush=True)
+        return True
+    except Exception:  # pylint: disable=broad-exception-caught
+      time.sleep(0.5)
+  print(f"  [wait_for_port] Timed out waiting for {ip}:{port}", flush=True)
+  return False
+
+
+def resolve_slice_ips(job_name: str, fallback_source: str, fallback_dest: str) -> tuple[str, str]:
+  """Resolves Host 0 (Sender) and Host 1 (Receiver) IPs via Kubernetes DNS with retries."""
+  sender_ip = None
+  receiver_ip = None
+  if job_name:
+    for _ in range(30):
+      try:
+        if not sender_ip:
+          sender_ip = socket.gethostbyname(f"{job_name}-slice-job-0-0.{job_name}")
+        if not receiver_ip:
+          receiver_ip = socket.gethostbyname(f"{job_name}-slice-job-1-0.{job_name}")
+        if sender_ip and receiver_ip:
+          print(f"  [DNS] Resolved slice-job-0-0: {sender_ip}, slice-job-1-0: {receiver_ip}", flush=True)
+          return sender_ip, receiver_ip
+      except Exception:  # pylint: disable=broad-exception-caught
+        pass
+      time.sleep(1.0)
+  return fallback_source, fallback_dest
+
+
+# pylint: disable-next=too-many-positional-arguments
 def transfer_and_benchmark(
     name: str,
-    src_weights: Dict[str, Any],
+    src_weights: List[Any],
     src_sharding: NamedSharding,
     dst_sharding: NamedSharding,
     args: argparse.Namespace,
+    port_offset: int = 0,
 ) -> Dict[str, Any]:
   """Executes weight transfer benchmark for a given sharding configuration."""
-  flat_src, treedef = jax.tree.flatten(src_weights)
+  job_name = os.environ.get("JOB_NAME", os.environ.get("JOBSET_NAME", ""))
+  source_ip, dest_ip = resolve_slice_ips(job_name, args.source_ip, args.dest_ip)
+
+  flat_src, _ = jax.tree.flatten(src_weights)
 
   total_bytes = sum(arr.nbytes for arr in flat_src)
   total_mb = total_bytes / (1024 * 1024)
@@ -322,100 +422,113 @@ def transfer_and_benchmark(
   jax.tree.map(lambda x: x.block_until_ready(), flat_src)
   jax.tree.map(lambda x: x.block_until_ready(), flat_dst_init)
 
-  last_syncer_dst = None
-  use_raiden_rpc = True
+  dest_port = args.dest_port + port_offset
+  listener_port = dest_port + 100
 
   print(f"\n--- Running Benchmark: {name} ---", flush=True)
   print(f"Total payload size: {total_mb:.2f} MB ({total_bytes} bytes)", flush=True)
 
-  start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
+  start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, dest_ip, dest_port)
 
-  if jax.process_count() > 1:
-    syncer_src = None
-    syncer_dst = None
-    if jax.process_index() == 0:
-      syncer_src = weight_synchronizer.WeightSynchronizer(
-          flat_src, bind_ip=args.source_ip, listener_port=args.dest_port + 100
-      )
-    elif jax.process_index() == 1:
-      syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port)
-      last_syncer_dst = syncer_dst
-    multihost_utils.sync_global_devices("syncer_init_done")
+  hostname = socket.gethostname()
+  local_ip = socket.gethostbyname(hostname)
+  print(
+      f"  [Role Check] Hostname: {hostname}, Local IP: {local_ip}, Source IP: {source_ip}, Dest IP: {dest_ip}", flush=True
+  )
 
-    for w in range(args.warmup_iterations):
-      multihost_utils.sync_global_devices(f"warmup_start_{w}")
-      print(f"  Warmup iteration {w + 1}/{args.warmup_iterations}...", flush=True)
-      if jax.process_index() == 0:
-        start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
-        syncer_src.d2h()
-        trigger_raiden_transfer(syncer_src, args.dest_ip, ws_dest=args.dest_port, start_transfer_req=start_req)
-      multihost_utils.sync_global_devices(f"warmup_end_{w}")
-
-    if args.profile_dir:
-      print(f"Starting JAX profiler trace output to: {args.profile_dir}", flush=True)
-      jax.profiler.start_trace(args.profile_dir)
-
-    latencies = []
-
-    for it in range(args.iterations):
-      multihost_utils.sync_global_devices(f"iter_start_{it}")
-      t0 = time.perf_counter()
-
-      if jax.process_index() == 0:
-        start_req = build_resharding_start_request(flat_src, src_sharding, dst_sharding, args.dest_ip, args.dest_port)
-        syncer_src.d2h()
-        trigger_raiden_transfer(syncer_src, args.dest_ip, ws_dest=args.dest_port, start_transfer_req=start_req)
-
-      multihost_utils.sync_global_devices(f"transfer_done_{it}")
-      if jax.process_index() == 1:
-        syncer_dst.h2d()
-
-      t1 = time.perf_counter()
-
-      elapsed_ms = (t1 - t0) * 1000.0
-      latencies.append(elapsed_ms)
-      print(f"  Iteration {it + 1}/{args.iterations}: {elapsed_ms:.2f} ms", flush=True)
-      multihost_utils.sync_global_devices(f"iter_end_{it}")
-
-    if jax.process_index() == 1:
-      jax.tree.map(lambda x: x.block_until_ready(), flat_dst_init)
-    multihost_utils.sync_global_devices("h2d_complete")
-
-    transferred_flat = flat_dst_init
+  if local_ip == source_ip or "slice-job-0" in hostname or "-0-0" in hostname:
+    is_sender = True
+    is_receiver = False
+  elif local_ip == dest_ip or "slice-job-1" in hostname or "-1-0" in hostname:
+    is_sender = False
+    is_receiver = True
   else:
-    for w in range(args.warmup_iterations):
-      print(f"  Warmup iteration {w + 1}/{args.warmup_iterations}...", flush=True)
-      syncer_src = weight_synchronizer.WeightSynchronizer(flat_src, bind_ip=args.source_ip)
-      syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port + w)
+    is_sender = source_ip != dest_ip
+    is_receiver = source_ip == dest_ip or dest_ip in ("127.0.0.1", "0.0.0.0")
+
+  print(f"  [Role Result] is_sender={is_sender}, is_receiver={is_receiver}", flush=True)
+
+  sender_ip = source_ip
+
+  syncer_src = None
+  syncer_dst = None
+
+  if is_sender:
+    syncer_src = weight_synchronizer.WeightSynchronizer(flat_src, bind_ip=source_ip, listener_port=listener_port)
+
+  if is_receiver:
+    syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=dest_port)
+
+  sender_ack_port = dest_port + 200
+  receiver_ack_port = dest_port + 300
+  ack_server = None
+
+  if is_sender:
+    ack_server = PersistentACKServer(sender_ack_port)
+  if is_receiver:
+    ack_server = PersistentACKServer(receiver_ack_port)
+
+  if is_sender:
+    wait_for_port(dest_ip, dest_port, timeout=60.0)
+    wait_for_port(dest_ip, receiver_ack_port, timeout=60.0)
+
+  if is_receiver:
+    wait_for_port(sender_ip, sender_ack_port, timeout=60.0)
+
+  for w in range(args.warmup_iterations):
+    print(f"  Warmup iteration {w + 1}/{args.warmup_iterations}...", flush=True)
+    if is_sender and syncer_src and ack_server:
       syncer_src.d2h()
-      trigger_raiden_transfer(syncer_src, args.dest_ip, syncer_dst, start_req)
+      trigger_raiden_transfer(syncer_src, dest_ip, ws_dest=dest_port, start_transfer_req=start_req)
+      send_completion_ack(dest_ip, receiver_ack_port)
+      ack_server.wait_for_ack(timeout=300.0)
+
+    if is_receiver and syncer_dst and ack_server:
+      ack_server.wait_for_ack(timeout=300.0)
       syncer_dst.h2d()
-      transferred_flat = flat_dst_init
-      jax.tree.map(lambda x: x.block_until_ready(), transferred_flat)
+      send_completion_ack(sender_ip, sender_ack_port)
 
-    if args.profile_dir:
-      print(f"Starting JAX profiler trace output to: {args.profile_dir}", flush=True)
-      jax.profiler.start_trace(args.profile_dir)
+  if args.profile_dir:
+    print(f"Starting JAX profiler trace output to: {args.profile_dir}", flush=True)
+    jax.profiler.start_trace(args.profile_dir)
 
-    latencies = []
+  latencies = []
 
-    for it in range(args.iterations):
-      t0 = time.perf_counter()
+  for it in range(args.iterations):
+    t0 = time.perf_counter()
 
-      port_offset = args.warmup_iterations + it
-      syncer_src = weight_synchronizer.WeightSynchronizer(flat_src, bind_ip=args.source_ip)
-      syncer_dst = weight_synchronizer.WeightSynchronizer(flat_dst_init, local_port=args.dest_port + port_offset)
+    if is_sender and syncer_src and ack_server:
       syncer_src.d2h()
-      trigger_raiden_transfer(syncer_src, args.dest_ip, syncer_dst, start_req)
+      trigger_raiden_transfer(syncer_src, dest_ip, ws_dest=dest_port, start_transfer_req=start_req)
+      send_completion_ack(dest_ip, receiver_ack_port)
+      ack_server.wait_for_ack(timeout=300.0)
+
+    if is_receiver and syncer_dst and ack_server:
+      ack_server.wait_for_ack(timeout=300.0)
       syncer_dst.h2d()
-      transferred_flat = flat_dst_init
+      send_completion_ack(sender_ip, sender_ack_port)
 
-      jax.tree.map(lambda x: x.block_until_ready(), transferred_flat)
-      t1 = time.perf_counter()
+    t1 = time.perf_counter()
 
-      elapsed_ms = (t1 - t0) * 1000.0
-      latencies.append(elapsed_ms)
-      print(f"  Iteration {it + 1}/{args.iterations}: {elapsed_ms:.2f} ms", flush=True)
+    elapsed_ms = (t1 - t0) * 1000.0
+    latencies.append(elapsed_ms)
+    print(f"  Iteration {it + 1}/{args.iterations}: {elapsed_ms:.2f} ms", flush=True)
+
+  print("  Finalizing scenario benchmark...", flush=True)
+
+  if is_sender and ack_server:
+    time.sleep(1.0)
+    send_completion_ack(dest_ip, receiver_ack_port)
+    ack_server.wait_for_ack(timeout=60.0)
+
+  if is_receiver and ack_server:
+    ack_server.wait_for_ack(timeout=60.0)
+    send_completion_ack(sender_ip, sender_ack_port)
+
+  time.sleep(2.0)
+
+  if ack_server:
+    ack_server.stop()
 
   if args.profile_dir:
     jax.profiler.stop_trace()
@@ -432,28 +545,13 @@ def transfer_and_benchmark(
 
   if args.verify_correctness:
     if jax.process_count() == 1 or jax.process_index() == 1:
-      if use_raiden_rpc and jax.process_count() > 1 and last_syncer_dst is not None:
-        last_syncer_dst.d2h()
-        transferred_flat_from_hbm = []
-        for idx, arr in enumerate(flat_dst_init):
-          h_buf = np.frombuffer(bytes(last_syncer_dst.get_host_buffer(idx, 0)), dtype=np.float32)[: arr.size].reshape(
-              arr.shape
-          )
-          transferred_flat_from_hbm.append(h_buf)
-        transferred_weights = jax.tree.unflatten(treedef, transferred_flat_from_hbm)
-      else:
-        transferred_flat_materialized = [jax.jit(lambda x: x * 1.0)(arr) for arr in transferred_flat]
-        transferred_weights = jax.tree.unflatten(treedef, transferred_flat_materialized)
-      for k in src_weights.keys():
-        src_k = np.array(src_weights[k]["kernel"])
-        dst_k = np.array(transferred_weights[k]["kernel"])
-        np.testing.assert_allclose(src_k, dst_k, rtol=1e-5)
-
-        if "bias" in src_weights[k]:
-          src_b = np.array(src_weights[k]["bias"])
-          dst_b = np.array(transferred_weights[k]["bias"])
-          np.testing.assert_allclose(src_b, dst_b, rtol=1e-5)
+      for idx, arr in enumerate(flat_dst_init):
+        dst_np = np.array(arr)
+        expected_val = float(idx + 1.0)
+        np.testing.assert_allclose(dst_np, expected_val, rtol=1e-5)
       print("  Correctness: VERIFIED PASSED", flush=True)
+
+  time.sleep(2.0)
 
   return {
       "name": name,
@@ -487,6 +585,7 @@ def main(raw_args: list[str] | None = None):
       src_dp_sharding,
       dst_dp_sharding,
       args,
+      port_offset=0,
   )
   results.append(res_dp)
 
@@ -502,6 +601,7 @@ def main(raw_args: list[str] | None = None):
       src_tp_sharding,
       dst_tp_sharding,
       args,
+      port_offset=10,
   )
   results.append(res_tp)
 
@@ -514,6 +614,7 @@ def main(raw_args: list[str] | None = None):
       src_tp_sharding,
       dst_fsdp_sharding,
       args,
+      port_offset=20,
   )
   results.append(res_tp_fsdp)
 
