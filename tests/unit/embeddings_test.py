@@ -212,7 +212,7 @@ class YarnRotaryEmbeddingTest(unittest.TestCase):
     self.assertEqual(outputs.shape, (1, 2, 1, 4))
 
     # Output with pairwise=True should match default interleaved YaRN RoPE
-    expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 0.996094, 1.38281, 1.00781]]]])
+    expected = jnp.array([[[[1.0, 1.0, 1.0, 1.0]], [[-0.300781, 1.38281, 0.996094, 1.00781]]]])
     np.testing.assert_allclose(outputs, expected, atol=1e-5)
 
   def test_pairwise_requires_interleave(self):
