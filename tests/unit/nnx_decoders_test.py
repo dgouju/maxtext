@@ -970,6 +970,75 @@ class TestNNXDecoderDeepseekAndGemma4(unittest.TestCase):
         (cfg.global_batch_size_to_train_on, cfg.max_target_length, cfg.vocab_size),
     )
 
+  def test_gemma4_block_external_kv_cache_matches_scanned_path(self):
+    """External-kv-cache path must numerically match the scanned (kv=None) path.
+
+    Guards the real stacked-parameter slice/re-stack in
+    ``Gemma4ScannableBlock._forward_with_external_kv_cache`` (``nnx.split`` of the
+    scanned local stack, ``param_scan_axis`` moveaxis, per-layer merge, re-stack,
+    ``nnx.update``) against the ``jax.lax.scan`` path. The mock-based
+    ``TestGemma4ScannableBlock`` tests cover call ordering / cache collection but
+    use trivial params, so they never exercise the real stacked-param mechanics.
+
+    Uses ``model_mode=TRAIN`` with ``dot_product`` attention: attention then
+    ignores the external caches (passing them straight through), so both paths
+    compute the same forward and only the loop mechanism (scan vs static unroll)
+    differs -- any mismatch is a slice/re-stack bug.
+    """
+    cfg = _make_config(
+        decoder_block="gemma4",
+        scan_layers=True,
+        num_decoder_layers=len(gemma4.GEMMA4_ATTENTION_PATTERN),  # exactly one full 5-local + 1-global block
+        base_emb_dim=128,
+        base_num_query_heads=4,
+        base_num_kv_heads=4,
+        # float32 + high matmul precision so the two paths agree to tight tolerance;
+        # the paths are mathematically identical, so any bf16-level rounding drift
+        # between scan and static-unroll compilation would only mask a real bug.
+        dtype="float32",
+        weight_dtype="float32",
+        matmul_precision="highest",
+    )
+    mesh = _make_mesh(cfg)
+
+    def make_block():
+      # Same seed => identical params in both blocks, so any output difference is
+      # attributable to the scan-vs-unroll code path, not initialization.
+      return gemma4.Gemma4ScannableBlock(
+          config=cfg,
+          mesh=mesh,
+          model_mode=MODEL_MODE_TRAIN,
+          quant=None,
+          num_of_layers=len(gemma4.GEMMA4_ATTENTION_PATTERN),
+          remat_policy_fn=None,
+          apply_internal_remat=False,
+          rngs=nnx.Rngs(params=0),
+      )
+
+    batch = cfg.global_batch_size_to_train_on
+    seq = cfg.max_target_length
+    inputs = jax.random.normal(self.rng, (batch, seq, cfg.emb_dim), dtype=cfg.dtype)
+    segment_ids = jnp.full((batch, seq), DECODING_ACTIVE_SEQUENCE_INDICATOR)
+    positions = jnp.broadcast_to(jnp.arange(seq)[None], (batch, seq))
+    call_kwargs = dict(
+        decoder_segment_ids=segment_ids,
+        decoder_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+
+    # Scanned path (kv_cache=None); scan_layers=True => returns (y, None).
+    y_scanned, _ = make_block()(inputs, **call_kwargs)
+
+    # External-kv path: one cache per layer, ordered local[0..4] then global.
+    num_layers = len(gemma4.GEMMA4_ATTENTION_PATTERN)
+    external_kv = tuple(jnp.zeros((batch, seq), dtype=cfg.dtype) for _ in range(num_layers))
+    y_external, updated_kvs = make_block()(inputs, **call_kwargs, kv_cache=external_kv)
+
+    self.assertEqual(y_external.shape, inputs.shape)
+    self.assertEqual(len(updated_kvs), num_layers)
+    np.testing.assert_allclose(y_external, y_scanned, rtol=1e-5, atol=1e-5)
+
 
 @pytest.mark.tpu_only
 class TestGemma4SmallNNXDecoder(unittest.TestCase):
