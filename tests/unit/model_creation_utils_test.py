@@ -729,7 +729,7 @@ class TestCreateNnxModel(unittest.TestCase):
         model_name="qwen3-vl-2b",
         override_model_config=True,
         scan_layers=False,
-        vision_projector_type="customized_mlp",
+        vision_projector_type="customized_vision_projector",
         vision_connector_num_layers=2,
         vision_connector_activation="gelu",
         vision_connector_use_bias=True,

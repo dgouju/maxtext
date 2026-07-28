@@ -94,10 +94,10 @@ class VisionEncoder(nnx.Module):
           f"for model_name={self.config.model_name!r}. Supported values are: {supported_blocks}."
       )
 
-    # If vision_projector_type is explicitly set to 'customized_mlp',
+    # If vision_projector_type is explicitly set to 'customized_vision_projector',
     # override the model's default projector with a custom MLP-based projector.
     vision_projector_type_config = getattr(self.config, "vision_projector_type", "default")
-    if vision_projector_type_config == "customized_mlp":
+    if vision_projector_type_config == "customized_vision_projector":
       setattr(
           self,
           projector_name,

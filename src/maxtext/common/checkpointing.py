@@ -88,7 +88,7 @@ def _expected_and_restored_params(abstract_nnx_state, restored_linen):
   return want, have
 
 
-def _is_custom_vision_projector_problem(path: str, want: dict) -> bool:
+def _is_custom_projector_problem(path: str, want: dict) -> bool:
   """Returns True if a weight mismatch belongs to a newly attached custom vision projector."""
   parts = [p for p in path.replace(".", "/").split("/") if p and p != "params"]
   if len(parts) >= 2 and parts[0] == "vision_encoder":
@@ -114,7 +114,8 @@ def _raise_on_weight_mismatch(want, have):
   without naming the weight.
   """
   problems = _weight_mismatches(want, have)
-  problems = [(p, why) for p, why in problems if not _is_custom_vision_projector_problem(p, want)]
+  # Ignore the weight mismatches in the custom projector so it can stay randomly initialized
+  problems = [(p, why) for p, why in problems if not _is_custom_projector_problem(p, want)]
   if not problems:
     return
   lines = "\n".join(f"  - '{p}': {why}" for p, why in problems)

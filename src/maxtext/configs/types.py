@@ -2148,7 +2148,7 @@ class VisionProjector(BaseModel):
   pixel_shuffle_ratio_for_vit: float = Field(0.5, description="Pixel shuffle ratio for the Vision Transformer.")
   projector_dropout_for_vit: float = Field(0.0, description="Dropout rate for the vision projector.")
   vision_projector_type: str = Field(
-      "default", description="Type of the vision projector to use. Supported: 'default', 'customized_mlp'."
+      "default", description="Type of the vision projector to use. Supported: 'default', 'customized_vision_projector'."
   )
   vision_connector_num_layers: int = Field(2, description="Number of layers in custom mlp projector.")
   vision_connector_hidden_size: int = Field(

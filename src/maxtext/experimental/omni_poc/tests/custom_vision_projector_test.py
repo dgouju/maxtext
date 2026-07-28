@@ -11,16 +11,17 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 
-# Ensure the parent directory is in sys.path so we can import maxtext
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+# Ensure the parent directory (src/) is in sys.path so we can import maxtext
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from maxtext.configs import pyconfig
 from maxtext.inference.maxengine import maxengine
 from maxtext.multimodal import processor as mm_processor
+from maxtext.utils.globals import MAXTEXT_PKG_DIR
 
 
 def test_load_custom_vision_projector(hf_access_token, param_path):
-  base_yml_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../configs/base.yml"))
+  base_yml_path = os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml")
 
   config = pyconfig.initialize(
       base_config=base_yml_path,
@@ -39,7 +40,7 @@ def test_load_custom_vision_projector(hf_access_token, param_path):
       override_model_config=True,
       attention="dot_product",
       hf_access_token=hf_access_token,
-      vision_projector_type="customized_mlp",
+      vision_projector_type="customized_vision_projector",
       vision_connector_num_layers=2,
       vision_connector_activation="gelu",
       vision_connector_use_bias=True,
