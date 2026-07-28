@@ -36,6 +36,11 @@ _DEFAULT_MAX_RETRIES = 3
 _RETRY_BACKOFF_S = 5.0
 
 
+def _is_retryable_http_status(status: int) -> bool:
+  """Return whether an HTTP response may succeed when retried."""
+  return status in (408, 409, 429) or status >= 500
+
+
 @dataclass
 class GenerationResult:
   """Result of a single /v1/completions request.
@@ -94,15 +99,17 @@ async def generate_batch_async(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    async with semaphore:
-      t0 = time.monotonic()
-      last_error = ""
-      for attempt in range(max_retries + 1):
-        try:
+    t0 = time.monotonic()
+    last_error = ""
+    for attempt in range(max_retries + 1):
+      retryable = True
+      try:
+        async with semaphore:
           async with session.post(api_url, json=payload) as resp:
             if resp.status != 200:
               body = await resp.text()
               last_error = f"HTTP {resp.status}: {body[:200]}"
+              retryable = _is_retryable_http_status(resp.status)
             else:
               data = await resp.json()
               latency = time.monotonic() - t0
@@ -114,17 +121,19 @@ async def generate_batch_async(
                   completion_tokens=usage.get("completion_tokens", 0),
                   latency_s=latency,
               )
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-          last_error = str(exc)
+      except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        last_error = str(exc)
 
-        if attempt < max_retries:
-          logger.warning(
-              "Request failed (attempt %d/%d): %s. Retrying.", attempt + 1, max_retries + 1, last_error
-          )
-          await asyncio.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+      if not retryable:
+        return GenerationResult(error=last_error, latency_s=time.monotonic() - t0)
 
-      latency = time.monotonic() - t0
-      return GenerationResult(error=last_error, latency_s=latency)
+      if attempt < max_retries:
+        logger.warning("Request failed (attempt %d/%d): %s. Retrying.", attempt + 1, max_retries + 1, last_error)
+        # The semaphore covers only active I/O. Release the concurrency slot
+        # before backoff so another request can use it.
+        await asyncio.sleep(_RETRY_BACKOFF_S * (attempt + 1))
+
+    return GenerationResult(error=last_error, latency_s=time.monotonic() - t0)
 
   async with aiohttp.ClientSession(timeout=timeout) as session:
     return list(await asyncio.gather(*[_generate_one(session, p) for p in prompts]))

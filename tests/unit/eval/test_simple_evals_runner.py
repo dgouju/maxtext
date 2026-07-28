@@ -21,7 +21,12 @@ logic only.
 
 from __future__ import annotations
 
+# Tests intentionally construct dataset-free eval objects through private state.
+# pylint: disable=protected-access
+
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import sys
 import tempfile
 import threading
 import time
@@ -40,6 +45,7 @@ from maxtext.eval.reporting.simple_evals_debug_reporter import (
     build_debug_report,
     write_debug_report,
 )
+from maxtext.eval.runner.async_client import _is_retryable_http_status, generate_batch_async
 from maxtext.eval.runner.simple_evals_runner import (
     SUPPORTED_TASKS,
     _build_arg_parser,
@@ -50,7 +56,8 @@ from maxtext.eval.runner.simple_evals_runner import (
     _validate_tasks,
 )
 from maxtext.eval.third_party.simple_evals import common as simple_evals_common
-from maxtext.eval.third_party.simple_evals.types import EvalResult
+from maxtext.eval.third_party.simple_evals.drop_eval import DropEval
+from maxtext.eval.third_party.simple_evals.types import EvalResult, SamplerResponse
 
 
 def _make_result(score, metrics=None) -> EvalResult:
@@ -131,8 +138,16 @@ class TestDebugInfo(unittest.TestCase):
   def test_debug_flag_defaults_off_and_can_be_enabled(self):
     parser = _build_arg_parser()
     required = [
-        "--model_name", "model", "--hf_path", "hf", "--base_output_directory", "/tmp",
-        "--run_name", "run", "--max_model_len", "4096",
+        "--model_name",
+        "model",
+        "--hf_path",
+        "hf",
+        "--base_output_directory",
+        "/tmp",
+        "--run_name",
+        "run",
+        "--max_model_len",
+        "4096",
     ]
     self.assertFalse(parser.parse_args(required).log_debug_info)
     defaults = parser.parse_args(required)
@@ -194,6 +209,8 @@ class TestDebugInfo(unittest.TestCase):
 
 
 class TestSamplerConcurrency(unittest.TestCase):
+  """Tests bounded task and HTTP request concurrency."""
+
   def test_task_worker_pool_uses_resolved_concurrency(self):
     lock = threading.Lock()
     active = 0
@@ -316,6 +333,151 @@ class TestSamplerConcurrency(unittest.TestCase):
       )
       response = sampler([{"role": "user", "content": "q"}])
     self.assertEqual(response.response_metadata["status"], "error")
+    self.assertEqual(response.response_text, "")
+
+
+class TestRequestFailureScoring(unittest.TestCase):
+  """Tests that infrastructure failures cannot receive benchmark credit."""
+
+  @staticmethod
+  def _drop_eval() -> DropEval:
+    eval_obj = DropEval.__new__(DropEval)
+    eval_obj.seed = 42
+    eval_obj._train_samples_per_prompt = 1
+    eval_obj.train_samples = [{"context": "TRAIN", "completion": "Answer: yes", "ref_text": "yes"}]
+    eval_obj.test_samples = [{"context": "TEST", "completion": "", "ref_text": "no"}]
+    return eval_obj
+
+  def test_drop_request_failure_always_scores_zero(self):
+    class FailureSampler:
+
+      @staticmethod
+      def _pack_message(content, role):
+        return {"content": content, "role": role}
+
+      @staticmethod
+      def __call__(message_list):
+        return SamplerResponse(
+            response_text="No response (request failed).",
+            actual_queried_message_list=message_list,
+            response_metadata={"status": "error"},
+        )
+
+    with mock.patch.object(simple_evals_common, "map_with_progress", side_effect=lambda fn, xs: list(map(fn, xs))):
+      result = self._drop_eval()(FailureSampler())
+
+    self.assertEqual(result.score, 0.0)
+    self.assertEqual(result.metrics["em_score"], 0.0)
+    self.assertEqual(result.metrics["f1_score"], 0.0)
+    self.assertIsNone(result.metadata["example_level_metadata"][0]["extracted_answer"])
+
+
+class TestDropPromptDeterminism(unittest.TestCase):
+  """Tests that DROP few-shot prompts do not depend on worker scheduling."""
+
+  @staticmethod
+  def _build_eval() -> DropEval:
+    """Build a dataset-free DROP eval for deterministic prompt tests."""
+    eval_obj = DropEval.__new__(DropEval)
+    eval_obj.seed = 42
+    eval_obj._train_samples_per_prompt = 2
+    eval_obj.train_samples = [
+        {"context": f"TRAIN-{index}", "completion": "Answer: yes", "ref_text": "yes"} for index in range(6)
+    ]
+    eval_obj.test_samples = [{"context": f"TEST-{index}", "completion": "", "ref_text": "yes"} for index in range(4)]
+    return eval_obj
+
+  @staticmethod
+  def _captured_prompts(reverse: bool) -> dict[str, tuple[str, ...]]:
+    """Capture test-to-few-shot assignments under a chosen worker order."""
+    prompts = {}
+
+    class CapturingSampler:
+      """Record each prompt while returning a valid model answer."""
+
+      @staticmethod
+      def _pack_message(content, role):
+        return {"content": content, "role": role}
+
+      @staticmethod
+      def __call__(message_list):
+        prompt = message_list[0]["content"]
+        test_id = next(f"TEST-{index}" for index in range(4) if f"TEST-{index}" in prompt)
+        prompts[test_id] = tuple(f"TRAIN-{index}" for index in range(6) if f"TRAIN-{index}" in prompt)
+        return SamplerResponse(
+            response_text="Answer: yes",
+            actual_queried_message_list=message_list,
+            response_metadata={"status": "success"},
+        )
+
+    def scheduled_map(fn, xs):
+      scheduled = reversed(xs) if reverse else xs
+      return [fn(item) for item in scheduled]
+
+    with mock.patch.object(simple_evals_common, "map_with_progress", side_effect=scheduled_map):
+      TestDropPromptDeterminism._build_eval()(CapturingSampler())
+    return prompts
+
+  def test_few_shot_selection_does_not_depend_on_worker_order(self):
+    self.assertEqual(self._captured_prompts(reverse=False), self._captured_prompts(reverse=True))
+
+
+class TestAsyncClientRetries(unittest.TestCase):
+  """Tests async-client HTTP retry classification."""
+
+  def test_only_transient_http_statuses_are_retryable(self):
+    for status in (408, 409, 429, 500, 503):
+      self.assertTrue(_is_retryable_http_status(status))
+    for status in (400, 401, 403, 404, 422):
+      self.assertFalse(_is_retryable_http_status(status))
+
+  def test_permanent_http_error_is_not_retried(self):
+    class FakeResponse:
+      """Minimal aiohttp response context manager."""
+
+      status = 400
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, *_args):
+        return None
+
+      @staticmethod
+      async def text():
+        return "invalid request"
+
+    class FakeSession:
+      """Minimal aiohttp session context manager."""
+
+      def __init__(self):
+        self.calls = 0
+
+      async def __aenter__(self):
+        return self
+
+      async def __aexit__(self, *_args):
+        return None
+
+      def post(self, *_args, **_kwargs):
+        self.calls += 1
+        return FakeResponse()
+
+    fake_session = FakeSession()
+    fake_aiohttp = SimpleNamespace(
+        ClientError=RuntimeError,
+        ClientTimeout=lambda **_kwargs: object(),
+        ClientSession=lambda **_kwargs: fake_session,
+    )
+    with (
+        mock.patch.dict(sys.modules, {"aiohttp": fake_aiohttp}),
+        mock.patch("maxtext.eval.runner.async_client.asyncio.sleep", new_callable=mock.AsyncMock) as sleep,
+    ):
+      result = asyncio.run(generate_batch_async(["prompt"], "http://server", "model", max_retries=3))
+
+    self.assertEqual(fake_session.calls, 1)
+    self.assertEqual(result[0].error, "HTTP 400: invalid request")
+    sleep.assert_not_awaited()
 
 
 class TestAimeExtractAnswer(unittest.TestCase):
@@ -347,6 +509,8 @@ class TestAimeExtractAnswer(unittest.TestCase):
 
 
 class TestGsm8kExtractAnswer(unittest.TestCase):
+  """Tests GSM8K final-answer extraction and dataset loading."""
+
   def test_final_answer_line(self):
     self.assertEqual(extract_gsm8k_answer("Reasoning\nAnswer: 1,234"), "1234")
 

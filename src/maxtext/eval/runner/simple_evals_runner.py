@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Run OpenAI simple-evals tasks against a local vLLM chat server."""
+
 from __future__ import annotations
 
 import argparse
@@ -40,7 +42,7 @@ SUPPORTED_TASKS = ("mmlu", "gpqa", "gsm8k", "drop", "mgsm", "mgsm_en", "aime2024
 
 
 def _describe_api_error(exc: Exception | None) -> str:
-  
+  """Format an OpenAI API exception with request and response context."""
   if exc is None:
     return "n/a"
   parts = [f"{type(exc).__name__}: {exc}"]
@@ -68,6 +70,9 @@ def _build_vllm_sampler(
     concurrency: int = 1,
     continue_on_request_error: bool = False,
 ):
+  """Build a bounded, retrying OpenAI-compatible chat sampler."""
+  # Optional dependencies are imported only when this runner is selected.
+  # pylint: disable=import-outside-toplevel
   try:
     import openai
     from openai import OpenAI
@@ -133,14 +138,14 @@ def _build_vllm_sampler(
         exc: Exception,
         *,
         status: str,
-        response_text: str,
         error_message: str,
     ):
+      """Return a zero-gradeable response or raise for a terminal failure."""
       response_metadata = {"usage": None, "status": status}
       if debug_record is not None:
         debug_record.update(
             status=status,
-            response_text=response_text,
+            response_text="",
             finish_reason=None,
             prompt_tokens=None,
             completion_tokens=None,
@@ -153,7 +158,7 @@ def _build_vllm_sampler(
         response_metadata.update(debug_record)
       if self.continue_on_request_error:
         return SamplerResponse(
-            response_text=response_text,
+            response_text="",
             response_metadata=response_metadata,
             actual_queried_message_list=message_list,
         )
@@ -161,6 +166,7 @@ def _build_vllm_sampler(
 
     @staticmethod
     def _success_response(message_list, response, debug_record, attempt_start: float):
+      """Convert a successful OpenAI response to a simple-evals response."""
       choice = response.choices[0]
       message = choice.message
       # An analysis-only GPT-OSS truncation is a valid model result:
@@ -192,6 +198,7 @@ def _build_vllm_sampler(
       )
 
     def _sample(self, message_list):
+      """Submit one request, retrying only failures that may be transient."""
       if self.system_message:
         message_list = [self._pack_message("system", self.system_message)] + message_list
       debug_record = debug_collector.begin(message_list) if debug_collector else None
@@ -226,7 +233,6 @@ def _build_vllm_sampler(
               debug_record,
               exc,
               status="bad_request",
-              response_text="No response (bad request).",
               error_message="vLLM rejected the evaluation request as invalid.",
           )
         except Exception as exc:  # pylint: disable=broad-except
@@ -243,7 +249,7 @@ def _build_vllm_sampler(
                 trial + 1,
                 _MAX_ATTEMPTS,
                 type(exc).__name__,
-                type(exc.__cause__).__name__ if exc.__cause__ else "n/a",
+                type(getattr(exc, "__cause__", None)).__name__ if getattr(exc, "__cause__", None) else "n/a",
                 time.monotonic() - attempt_start,
                 time.monotonic() - call_start,
                 threading.current_thread().name,
@@ -252,7 +258,9 @@ def _build_vllm_sampler(
             )
             time.sleep(backoff)
       assert last_exc is not None
-      attempts_made = debug_record["attempt_count"] if debug_record is not None else trial + 1
+      attempts_made = trial + 1
+      if debug_record is not None:
+        attempts_made = debug_record.get("attempt_count", attempts_made)
       logger.error(
           "vLLM request failed after %d attempt(s) and %.1fs total (thread=%s): %s",
           attempts_made,
@@ -266,7 +274,6 @@ def _build_vllm_sampler(
           debug_record,
           last_exc,
           status="error",
-          response_text="No response (request failed).",
           error_message=f"vLLM request failed after {attempts_made} attempt(s).",
       )
 
@@ -354,6 +361,9 @@ def _validate_tasks(tasks: list[str]) -> None:
 
 
 def run_simple_evals(cfg: dict, hf_token: str | None = None) -> dict:
+  """Run selected simple-evals tasks and write their aggregate results."""
+  # Heavy and optional runtime dependencies stay lazy for other eval modes.
+  # pylint: disable=import-outside-toplevel
   from maxtext.eval.reporting.json_reporter import write_results
   from maxtext.eval.runner.warmup import warmup_chat_server
 
@@ -385,7 +395,7 @@ def run_simple_evals(cfg: dict, hf_token: str | None = None) -> dict:
 
     debug_collector = SimpleEvalsDebugCollector()
   is_rank0 = False  # set inside with block; initialized here so post-block ref is safe
-  with build_server_manager(cfg, token) as server:
+  with build_server_manager(cfg, token, enable_chat_api=True) as server:
     import jax as _jax
     from jax.experimental import multihost_utils as _multihost_utils
 
@@ -442,9 +452,7 @@ def run_simple_evals(cfg: dict, hf_token: str | None = None) -> dict:
       generation_stats={
           "num_samples": num_samples,
           "n_repeats": n_repeats,
-          "effective_repeats": {
-              task: _effective_repeats(task, num_samples, n_repeats) for task in tasks
-          },
+          "effective_repeats": {task: _effective_repeats(task, num_samples, n_repeats) for task in tasks},
           "task_variants": {
               task: ("all_11_languages" if task == "mgsm" else "english_only" if task == "mgsm_en" else "default")
               for task in tasks
@@ -471,9 +479,7 @@ def run_simple_evals(cfg: dict, hf_token: str | None = None) -> dict:
     output["debug_local_path"] = debug_local_path
     if gcs_results_path:
       secondary_debug_path = (
-          gcs_results_path
-          if gcs_results_path.endswith("/")
-          else f"{gcs_results_path.rsplit('.', 1)[0]}.debug.txt"
+          gcs_results_path if gcs_results_path.endswith("/") else f"{gcs_results_path.rsplit('.', 1)[0]}.debug.txt"
       )
       maybe_upload_to_gcs({"local_path": debug_local_path}, secondary_debug_path)
   return output
@@ -514,7 +520,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
       default=None,
       help=(
           "Maximum in-flight inference requests. By default, choose automatically from CPU count, "
-          "accelerator count, max_num_seqs, and chat batch capacity."
+          "accelerator count, and max_num_seqs."
       ),
   )
   parser.add_argument(

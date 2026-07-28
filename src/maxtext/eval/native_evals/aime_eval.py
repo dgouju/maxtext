@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""AIME 2024 and 2025 simple-evals tasks."""
+
 from __future__ import annotations
 
 import random
@@ -22,6 +24,9 @@ import pandas
 from maxtext.eval.third_party.simple_evals import common
 from maxtext.eval.third_party.simple_evals.common import HTML_JINJA
 from maxtext.eval.third_party.simple_evals.types import Eval, EvalResult, SamplerBase, SingleEvalResult
+
+# SamplerBase intentionally preserves the vendored simple-evals API.
+# pylint: disable=protected-access
 
 _AIME_2024_URL = (
     "https://huggingface.co/datasets/Maxwell-Jia/AIME_2024/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet"
@@ -37,7 +42,7 @@ _DATASET_BY_YEAR = {
 
 QUERY_TEMPLATE = (
     "Solve this competition math problem. The final answer is always an integer between 0 and 999. "
-    'Think step by step, then write the final answer by itself on the last line in the format '
+    "Think step by step, then write the final answer by itself on the last line in the format "
     '"Answer: $N" (without quotes), where $N is the integer answer.\n\n{problem}'
 )
 
@@ -71,22 +76,20 @@ class AIMEEval(Eval):
 
   def __call__(self, sampler: SamplerBase) -> EvalResult:
     def fn(row: dict):
-      prompt_messages = [
-          sampler._pack_message(content=QUERY_TEMPLATE.format(problem=row["problem"]), role="user")
-      ]
+      prompt_messages = [sampler._pack_message(content=QUERY_TEMPLATE.format(problem=row["problem"]), role="user")]
       sampler_response = sampler(prompt_messages)
       response_text = sampler_response.response_text
       actual_queried_prompt_messages = sampler_response.actual_queried_message_list
-      extracted_answer = extract_answer(response_text)
+      extracted_answer = extract_answer(response_text) if common.request_succeeded(sampler_response) else None
       score = 1.0 if extracted_answer is not None and int(extracted_answer) == int(row["answer"]) else 0.0
       html = common.jinja_env.from_string(HTML_JINJA).render(
           prompt_messages=actual_queried_prompt_messages,
-          next_message=dict(content=response_text, role="assistant"),
+          next_message={"content": response_text, "role": "assistant"},
           score=score,
           correct_answer=row["answer"],
           extracted_answer=extracted_answer,
       )
-      convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
+      convo = actual_queried_prompt_messages + [{"content": response_text, "role": "assistant"}]
       return SingleEvalResult(
           html=html,
           score=score,

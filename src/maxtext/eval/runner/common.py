@@ -29,15 +29,20 @@ def resolve_token(cfg: dict, hf_token: str | None) -> str | None:
   return hf_token or os.environ.get("HF_TOKEN") or None
 
 
-def build_server_manager(cfg: dict, token: str | None) -> "VllmServerManager":
+def build_server_manager(
+    cfg: dict,
+    token: str | None,
+    *,
+    enable_chat_api: bool = False,
+) -> "VllmServerManager":
   """Build a VllmServerManager from a merged config dict.
 
   Args:
     cfg: Merged configuration dict. Required key: max_model_len. Common
       optional keys: tensor_parallel_size, server_host, server_port,
-      max_num_batched_tokens, max_num_seqs, concurrency, hf_mode,
-      enable_expert_parallel.
+      max_num_batched_tokens, max_num_seqs, hf_mode, enable_expert_parallel.
     token: HuggingFace token (or None).
+    enable_chat_api: Whether this runner needs /v1/chat/completions.
 
   Returns:
     A VllmServerManager instance ready for use as a context manager.
@@ -65,8 +70,6 @@ def build_server_manager(cfg: dict, token: str | None) -> "VllmServerManager":
   expert_parallel_size = int(cfg.get("expert_parallel_size") or 1)
   data_parallel_size = int(cfg.get("data_parallel_size") or 1)
   hbm_memory_utilization = float(cfg.get("hbm_memory_utilization") or 0.3)
-  chat_batch_wait_s = float(cfg.get("chat_batch_wait_ms") or 20.0) / 1000.0
-  chat_batch_max_size = int(cfg.get("chat_batch_max_size") or 64)
   concurrency = cfg.get("concurrency")
   if concurrency is not None:
     concurrency = int(concurrency)
@@ -86,8 +89,7 @@ def build_server_manager(cfg: dict, token: str | None) -> "VllmServerManager":
       max_num_batched_tokens=max_num_batched_tokens,
       max_num_seqs=max_num_seqs,
       hbm_memory_utilization=hbm_memory_utilization,
-      chat_batch_wait_s=chat_batch_wait_s,
-      chat_batch_max_size=chat_batch_max_size,
+      enable_chat_api=enable_chat_api,
       concurrency=concurrency,
       env=server_env,
   )
@@ -136,23 +138,6 @@ def add_server_args(parser: argparse.ArgumentParser) -> None:
       type=float,
       default=0.3,
       help=("Fraction of HBM reserved for KV cache."),
-  )
-  parser.add_argument(
-      "--chat_batch_wait_ms",
-      type=float,
-      default=20.0,
-      help=(
-          "Max ms /v1/chat/completions buffers a request before flushing "
-          "whatever has accumulated into one batched llm.generate() call. "
-          "Raising this trades per-request latency for larger batches under "
-          "concurrent load (evalchemy, simple_evals)."
-      ),
-  )
-  parser.add_argument(
-      "--chat_batch_max_size",
-      type=int,
-      default=64,
-      help="Max requests /v1/chat/completions batches into one llm.generate() call before flushing early.",
   )
   parser.add_argument("--hf_token", help="HuggingFace token for gated models.")
   parser.add_argument("--skip_warmup", action="store_true", help="Skip the server warmup phase.")

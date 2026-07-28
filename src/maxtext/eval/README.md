@@ -130,30 +130,13 @@ official accuracy. The debug report also shows diagnostic accuracy excluding
 infrastructure failures; that diagnostic must not be used as the published
 benchmark score.
 
-Before a long TPU benchmark, run the one-shot chat-path diagnostic with the
-same model/server settings. For an 8-chip v6e GPT-OSS deployment in HF mode:
+Before a long TPU benchmark, run the simple-evals unit suite, which checks
+Harmony output separation, request-error behavior, concurrency, and result
+reporting:
 
 ```bash
-python -m maxtext.eval.runner.debug_simple_evals \
-  --model_name gpt-oss-20b \
-  --hf_path openai/gpt-oss-20b \
-  --hf_mode \
-  --base_output_directory /tmp \
-  --run_name simple_evals_debug \
-  --max_model_len 32768 \
-  --tensor_parallel_size 8 \
-  --debug_max_tokens 1024 \
-  --reasoning_effort high \
-  --debug_output /tmp/simple_evals_tpu_debug.json
+pytest tests/unit/eval/test_simple_evals_runner.py
 ```
-
-The script launches the normal in-process server and checks Harmony prompt
-rendering, final/reasoning/raw separation, forced analysis-only truncation,
-diagnostic opt-in, token accounting, and two-request batch response ordering.
-It prints `PASS` and exits zero only when every applicable check succeeds;
-otherwise it writes the failure to the JSON report and exits nonzero. When
-testing a MaxText checkpoint, pass the same `--checkpoint_path` and
-`--model_name` used by the benchmark instead of `--hf_mode`.
 
 ## Common Flags
 

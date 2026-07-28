@@ -82,7 +82,7 @@ class TestBuildApp(unittest.TestCase):
     from maxtext.eval.runner.server_manager import _build_app  # pylint: disable=import-outside-toplevel
     from starlette.testclient import TestClient  # pylint: disable=import-outside-toplevel
 
-    self.app = _build_app(self.mock_llm)
+    self.app = _build_app(self.mock_llm, enable_chat_api=True)
     self.client = TestClient(self.app)
 
   def tearDown(self):
@@ -289,7 +289,7 @@ class TestBuildApp(unittest.TestCase):
             return_value=("private reasoning", "Answer: 42", False),
         ) as parse,
     ):
-      client = TestClient(_build_app(mock_llm))
+      client = TestClient(_build_app(mock_llm, enable_chat_api=True))
       response = client.post(
           "/v1/chat/completions",
           json={
@@ -331,7 +331,7 @@ class TestBuildApp(unittest.TestCase):
             return_value=("private", "final", False),
         ),
     ):
-      response = TestClient(_build_app(mock_llm)).post(
+      response = TestClient(_build_app(mock_llm, enable_chat_api=True)).post(
           "/v1/chat/completions",
           json={
               "model": "gpt-oss-20b",
@@ -356,7 +356,7 @@ class TestBuildApp(unittest.TestCase):
         max_model_len=5,
     )
     self.mock_sampling_params_cls.reset_mock()
-    response = TestClient(_build_app(mock_llm)).post(
+    response = TestClient(_build_app(mock_llm, enable_chat_api=True)).post(
         "/v1/chat/completions",
         json={"model": "m", "messages": [{"role": "user", "content": "q"}], "max_tokens": 10},
     )
@@ -370,7 +370,7 @@ class TestBuildApp(unittest.TestCase):
     mock_llm = _make_mock_llm()
     mock_llm.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other"))
     mock_llm.get_tokenizer.return_value.apply_chat_template.side_effect = TypeError("bad template")
-    response = TestClient(_build_app(mock_llm)).post(
+    response = TestClient(_build_app(mock_llm, enable_chat_api=True)).post(
         "/v1/chat/completions",
         json={
             "model": "m",
@@ -401,7 +401,6 @@ class TestBuildApp(unittest.TestCase):
 
   def test_completions_top_logprobs_populated(self):
     """When logprobs is requested, top_logprobs entries must be non-None dicts."""
-    from types import SimpleNamespace  # pylint: disable=import-outside-toplevel
 
     mock_output = _make_mock_output(generated_text="hi", prompt_token_ids=[1], generated_token_ids=[4, 5])
     mock_output.outputs[0].logprobs = [
@@ -480,15 +479,12 @@ class TestChatCompletionsBatching(unittest.IsolatedAsyncioTestCase):
 
     def fake_generate(prompts, _sampling_params):
       calls.append(list(prompts))
-      return [
-          _make_mock_output(generated_text=f"reply-to-msg{p['prompt_token_ids'][0]}")
-          for p in prompts
-      ]
+      return [_make_mock_output(generated_text=f"reply-to-msg{p['prompt_token_ids'][0]}") for p in prompts]
 
     mock_llm = self._make_llm(fake_generate)
     # Wide window so all 5 concurrent requests land in the same pending batch
     # before the timer fires -- this asserts real coalescing, not a timing fluke.
-    app = _build_app(mock_llm, chat_batch_wait_s=0.2, chat_batch_max_size=64)
+    app = _build_app(mock_llm, enable_chat_api=True)
 
     responses = await asyncio.gather(*[self._post_chat(app, f"msg{i}") for i in range(5)])
 
@@ -509,9 +505,7 @@ class TestChatCompletionsBatching(unittest.IsolatedAsyncioTestCase):
       return [_make_mock_output(generated_text="ok") for _ in prompts]
 
     mock_llm = self._make_llm(fake_generate)
-    # 5s window: if early-flush-at-max-batch didn't work, the wait_for below
-    # would time out instead of the requests completing almost immediately.
-    app = _build_app(mock_llm, chat_batch_wait_s=5.0, chat_batch_max_size=2)
+    app = _build_app(mock_llm, enable_chat_api=True, request_concurrency=2)
 
     responses = await asyncio.wait_for(
         asyncio.gather(*[self._post_chat(app, f"m{i}") for i in range(4)]),
@@ -526,7 +520,7 @@ class TestChatCompletionsBatching(unittest.IsolatedAsyncioTestCase):
     from maxtext.eval.runner.server_manager import _build_app  # pylint: disable=import-outside-toplevel
 
     mock_llm = self._make_llm(ValueError("boom: simulated engine failure"))
-    app = _build_app(mock_llm, chat_batch_wait_s=0.05, chat_batch_max_size=64)
+    app = _build_app(mock_llm, enable_chat_api=True)
 
     responses = await asyncio.wait_for(
         asyncio.gather(*[self._post_chat(app, f"m{i}") for i in range(3)]),
@@ -535,18 +529,15 @@ class TestChatCompletionsBatching(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(all(r.status_code == 500 for r in responses))
     self.assertTrue(all("boom" in r.json().get("detail", "") for r in responses))
 
-  async def test_admission_control_rejects_request_beyond_resolved_concurrency(self):
+  async def test_chat_endpoint_is_disabled_unless_requested(self):
     from maxtext.eval.runner.server_manager import _build_app  # pylint: disable=import-outside-toplevel
 
     mock_llm = self._make_llm(lambda prompts, _: [_make_mock_output() for _ in prompts])
-    app = _build_app(
-        mock_llm,
-        chat_batch_wait_s=0.2,
-        chat_batch_max_size=64,
-        request_concurrency=1,
-    )
-    responses = await asyncio.gather(self._post_chat(app, "m1"), self._post_chat(app, "m2"))
-    self.assertEqual(sorted(response.status_code for response in responses), [200, 429])
+    with patch("maxtext.eval.runner.server_manager._is_harmony_model") as is_harmony_model:
+      app = _build_app(mock_llm)
+    is_harmony_model.assert_not_called()
+    response = await self._post_chat(app, "m1")
+    self.assertEqual(response.status_code, 404)
 
 
 if __name__ == "__main__":

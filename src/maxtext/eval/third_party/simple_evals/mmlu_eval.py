@@ -82,58 +82,57 @@ subject2category = {
 
 
 class MMLUEval(Eval):
-    def __init__(self, num_examples: int | None = None, language: str = "EN-US"):
-        if language != "EN-US":
-            url = f"https://openaipublic.blob.core.windows.net/simple-evals/mmlu_{language}.csv"
-        else:
-            url = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-        df = pandas.read_csv(url)
-        examples = [row.to_dict() for _, row in df.iterrows()]
-        if num_examples:
-            examples = random.Random(0).sample(examples, num_examples)
-        self.examples = examples
 
-    def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(row: dict):
-            prompt_messages = [
-                sampler._pack_message(
-                    content=format_multichoice_question(row), role="user"
-                )
-            ]
-            sampler_response = sampler(prompt_messages)
-            response_text = sampler_response.response_text
-            actual_queried_prompt_messages = sampler_response.actual_queried_message_list
-            response_text = normalize_response(response_text)
-            extracted_answer = None
-            for answer_regex in MULTILINGUAL_ANSWER_REGEXES:
-                regex = MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(answer_regex)
-                match = re.search(regex, response_text)
-                if match:
-                    extracted_answer = normalize_extracted_answer(match.group(1))
-                    break
-            score = 1.0 if extracted_answer == row["Answer"] else 0.0
-            html = common.jinja_env.from_string(HTML_JINJA).render(
-                prompt_messages=actual_queried_prompt_messages,
-                next_message=dict(content=response_text, role="assistant"),
-                score=score,
-                correct_answer=row["Answer"],
-                extracted_answer=extracted_answer,
-            )
-            convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
-            category = subject2category.get(row["Subject"], "other")
-            return SingleEvalResult(
-                html=html,
-                score=score,
-                metrics={category: score},
-                convo=convo,
-                example_level_metadata={
-                    "request_id": sampler_response.response_metadata.get("request_id"),
-                    "request_status": sampler_response.response_metadata.get("status", "success"),
-                    "score": score,
-                    "correct_answer": row["Answer"],
-                    "extracted_answer": extracted_answer,
-                },
-            )
+  def __init__(self, num_examples: int | None = None, language: str = "EN-US"):
+    if language != "EN-US":
+      url = f"https://openaipublic.blob.core.windows.net/simple-evals/mmlu_{language}.csv"
+    else:
+      url = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+    df = pandas.read_csv(url)
+    examples = [row.to_dict() for _, row in df.iterrows()]
+    if num_examples:
+      examples = random.Random(0).sample(examples, num_examples)
+    self.examples = examples
 
-        results = common.map_with_progress(fn, self.examples)
-        return common.aggregate_results(results)
+  def __call__(self, sampler: SamplerBase) -> EvalResult:
+    def fn(row: dict):
+      prompt_messages = [sampler._pack_message(content=format_multichoice_question(row), role="user")]
+      sampler_response = sampler(prompt_messages)
+      response_text = sampler_response.response_text
+      actual_queried_prompt_messages = sampler_response.actual_queried_message_list
+      request_succeeded = common.request_succeeded(sampler_response)
+      response_text = normalize_response(response_text) if request_succeeded else ""
+      extracted_answer = None
+      if request_succeeded:
+        for answer_regex in MULTILINGUAL_ANSWER_REGEXES:
+          regex = MULTILINGUAL_ANSWER_PATTERN_TEMPLATE.format(answer_regex)
+          match = re.search(regex, response_text)
+          if match:
+            extracted_answer = normalize_extracted_answer(match.group(1))
+            break
+      score = 1.0 if extracted_answer == row["Answer"] else 0.0
+      html = common.jinja_env.from_string(HTML_JINJA).render(
+          prompt_messages=actual_queried_prompt_messages,
+          next_message=dict(content=response_text, role="assistant"),
+          score=score,
+          correct_answer=row["Answer"],
+          extracted_answer=extracted_answer,
+      )
+      convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
+      category = subject2category.get(row["Subject"], "other")
+      return SingleEvalResult(
+          html=html,
+          score=score,
+          metrics={category: score},
+          convo=convo,
+          example_level_metadata={
+              "request_id": sampler_response.response_metadata.get("request_id"),
+              "request_status": sampler_response.response_metadata.get("status", "success"),
+              "score": score,
+              "correct_answer": row["Answer"],
+              "extracted_answer": extracted_answer,
+          },
+      )
+
+    results = common.map_with_progress(fn, self.examples)
+    return common.aggregate_results(results)

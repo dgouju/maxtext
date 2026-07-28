@@ -81,116 +81,110 @@ LANG_TO_ANSWER_PREFIX = {
 
 
 def parse_answer(answer: str, answer_prefix: str) -> str:
-    if answer_prefix not in answer:
-        return ""
+  if answer_prefix not in answer:
+    return ""
 
-    answer_text = answer.split(answer_prefix)[-1].strip()
+  answer_text = answer.split(answer_prefix)[-1].strip()
 
-    # find all the numbers (including decimals) in the string
-    numbers = re.findall(r"\d+\.?\d*", answer_text.replace(",", ""))
+  # find all the numbers (including decimals) in the string
+  numbers = re.findall(r"\d+\.?\d*", answer_text.replace(",", ""))
 
-    # return the first number (removing trailing decimal point if present),
-    # or an empty string if there were no numbers
-    return numbers[-1].rstrip(".") if numbers else ""
+  # return the first number (removing trailing decimal point if present),
+  # or an empty string if there were no numbers
+  return numbers[-1].rstrip(".") if numbers else ""
 
 
 def score_mgsm(target: str, prediction: str) -> bool:
-    if "." in prediction:
-        prediction = prediction.rstrip("0").rstrip(".")
+  if "." in prediction:
+    prediction = prediction.rstrip("0").rstrip(".")
 
-    target = target.replace(",", "")
-    prediction = prediction.replace(",", "")
+  target = target.replace(",", "")
+  prediction = prediction.replace(",", "")
 
-    return target == prediction
+  return target == prediction
 
 
 def get_lang_examples(lang: str) -> list[dict[str, str]]:
-    fpath = LANG_TO_FPATH[lang]
-    examples = []
-    with common.url_to_fileobj(fpath, binary=True) as f:
-        for raw_line in f:
-            line = raw_line.decode("utf-8").strip()
-            inputs, targets = line.split("\t")
-            if "." in targets:
-                raise ValueError(f"targets {targets} contains a decimal point.")
-            # targets = int(targets.replace(",", ""))
-            examples.append({"inputs": inputs, "targets": targets, "lang": lang})
-    return examples
+  fpath = LANG_TO_FPATH[lang]
+  examples = []
+  with common.url_to_fileobj(fpath, binary=True) as f:
+    for raw_line in f:
+      line = raw_line.decode("utf-8").strip()
+      inputs, targets = line.split("\t")
+      if "." in targets:
+        raise ValueError(f"targets {targets} contains a decimal point.")
+      # targets = int(targets.replace(",", ""))
+      examples.append({"inputs": inputs, "targets": targets, "lang": lang})
+  return examples
 
 
 def get_all_examples() -> list[dict[str, str]]:
-    examples = []
-    for lang in ALL_LANGUAGES:
-        if lang != "en":
-            continue
-        examples += get_lang_examples(lang)
-    return examples
+  examples = []
+  for lang in ALL_LANGUAGES:
+    if lang != "en":
+      continue
+    examples += get_lang_examples(lang)
+  return examples
 
 
 class MGSMEval(Eval):
-    def __init__(
-        self,
-        num_examples_per_lang: int = 250,  # restrict to a subset of the data for debugging
-        languages: Optional[list[str]] = ALL_LANGUAGES,
-    ):
-        if languages is None:
-            languages = ALL_LANGUAGES
-        else:
-            for language in languages:
-                if language not in ALL_LANGUAGES:
-                    raise ValueError(
-                        f"language {language} is not a valid language. "
-                        f"It should be one in {ALL_LANGUAGES}"
-                    )
-        self._languages = languages
-        self._num_examples_per_lang = num_examples_per_lang
 
-        examples = []
-        for lang in self._languages:
-            lang_examples = get_lang_examples(lang)
-            examples.extend(lang_examples[: self._num_examples_per_lang])
-        self.examples = examples
+  def __init__(
+      self,
+      num_examples_per_lang: int = 250,  # restrict to a subset of the data for debugging
+      languages: Optional[list[str]] = ALL_LANGUAGES,
+  ):
+    if languages is None:
+      languages = ALL_LANGUAGES
+    else:
+      for language in languages:
+        if language not in ALL_LANGUAGES:
+          raise ValueError(f"language {language} is not a valid language. " f"It should be one in {ALL_LANGUAGES}")
+    self._languages = languages
+    self._num_examples_per_lang = num_examples_per_lang
 
-    def __call__(self, sampler: SamplerBase) -> EvalResult:
-        def fn(example: dict[str, str]):
-            language = example["lang"]
-            latin_language = "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
-            correct_answer = example["targets"]
-            instruction = LANG_TO_INSTRUCTIONS[language]
-            prompt_messages = [
-                sampler._pack_message(
-                    content=instruction.format(input=example["inputs"]), role="user"
-                )
-            ]
-            sampler_response = sampler(prompt_messages)
-            response_text = sampler_response.response_text
-            actual_queried_prompt_messages = sampler_response.actual_queried_message_list
+    examples = []
+    for lang in self._languages:
+      lang_examples = get_lang_examples(lang)
+      examples.extend(lang_examples[: self._num_examples_per_lang])
+    self.examples = examples
 
-            answer_prefix = LANG_TO_ANSWER_PREFIX[language]
-            extracted_answer = parse_answer(response_text, answer_prefix)
+  def __call__(self, sampler: SamplerBase) -> EvalResult:
+    def fn(example: dict[str, str]):
+      language = example["lang"]
+      latin_language = "group_latin" if language in LATIN_LANGUAGES else "group_non_latin"
+      correct_answer = example["targets"]
+      instruction = LANG_TO_INSTRUCTIONS[language]
+      prompt_messages = [sampler._pack_message(content=instruction.format(input=example["inputs"]), role="user")]
+      sampler_response = sampler(prompt_messages)
+      response_text = sampler_response.response_text
+      actual_queried_prompt_messages = sampler_response.actual_queried_message_list
 
-            score = score_mgsm(correct_answer, extracted_answer)
-            html = common.jinja_env.from_string(HTML_JINJA).render(
-                prompt_messages=actual_queried_prompt_messages,
-                next_message=dict(content=response_text, role="assistant"),
-                score=score,
-                correct_answer=correct_answer,
-                extracted_answer=extracted_answer or None,
-            )
-            convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
-            return SingleEvalResult(
-                html=html,
-                score=score,
-                convo=convo,
-                metrics={language: score, latin_language: score},
-                example_level_metadata={
-                    "request_id": sampler_response.response_metadata.get("request_id"),
-                    "request_status": sampler_response.response_metadata.get("status", "success"),
-                    "score": score,
-                    "correct_answer": correct_answer,
-                    "extracted_answer": extracted_answer or None,
-                },
-            )
+      answer_prefix = LANG_TO_ANSWER_PREFIX[language]
+      extracted_answer = parse_answer(response_text, answer_prefix) if common.request_succeeded(sampler_response) else ""
 
-        results = common.map_with_progress(fn, self.examples)
-        return common.aggregate_results(results, default_stats=("mean", "std"))
+      score = score_mgsm(correct_answer, extracted_answer)
+      html = common.jinja_env.from_string(HTML_JINJA).render(
+          prompt_messages=actual_queried_prompt_messages,
+          next_message=dict(content=response_text, role="assistant"),
+          score=score,
+          correct_answer=correct_answer,
+          extracted_answer=extracted_answer or None,
+      )
+      convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
+      return SingleEvalResult(
+          html=html,
+          score=score,
+          convo=convo,
+          metrics={language: score, latin_language: score},
+          example_level_metadata={
+              "request_id": sampler_response.response_metadata.get("request_id"),
+              "request_status": sampler_response.response_metadata.get("status", "success"),
+              "score": score,
+              "correct_answer": correct_answer,
+              "extracted_answer": extracted_answer or None,
+          },
+      )
+
+    results = common.map_with_progress(fn, self.examples)
+    return common.aggregate_results(results, default_stats=("mean", "std"))

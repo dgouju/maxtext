@@ -21,7 +21,6 @@ from collections.abc import Mapping
 import importlib
 import logging
 import os
-import sys
 import threading
 import time
 import uuid
@@ -29,11 +28,17 @@ from typing import Any
 
 import requests
 
+from maxtext.eval.runner.debug_utils import (
+    MemoryMonitor,
+    log_request_diagnostics,
+)
+
 logger = logging.getLogger(__name__)
 
 
 _HEALTH_ENDPOINT = "/health"
 _AUTO_REQUESTS_PER_ACCELERATOR = 4
+_CHAT_BATCH_WAIT_S = 0.02
 _HARMONY_UTILS_MODULE = "vllm.entrypoints.openai.parser.harmony_utils"
 
 
@@ -83,9 +88,7 @@ def _render_harmony_chat_prompt(messages: list[dict[str, Any]], reasoning_effort
   )
   missing_helpers = [name for name in required_helpers if not callable(getattr(harmony_utils, name, None))]
   if missing_helpers:
-    raise RuntimeError(
-        f"Installed vLLM Harmony API is missing required helper(s): {', '.join(missing_helpers)}."
-    )
+    raise RuntimeError(f"Installed vLLM Harmony API is missing required helper(s): {', '.join(missing_helpers)}.")
 
   if reasoning_effort == "none":
     raise ValueError("Harmony does not support reasoning_effort='none'.")
@@ -107,88 +110,17 @@ def _top_logprobs_dict(tokenizer: Any, lp_dict: dict | None) -> "dict[str, float
   return {tokenizer.decode([tid]): lp.logprob for tid, lp in lp_dict.items()}
 
 
-def _host_rss_bytes() -> int:
-  """Resident set size of this process in bytes; -1 if unavailable."""
-  try:
-    with open("/proc/self/status", "r", encoding="utf-8") as f:
-      for line in f:
-        if line.startswith("VmRSS:"):
-          return int(line.split()[1]) * 1024  # kB -> bytes
-  except OSError:
-    pass
-  try:
-    import resource  # pylint: disable=import-outside-toplevel
-
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # ru_maxrss is kB on Linux, bytes on macOS.
-    return rss if sys.platform == "darwin" else rss * 1024
-  except Exception:  # pylint: disable=broad-except
-    return -1
-
-
-def _hbm_stats() -> dict:
-  """Aggregate JAX HBM stats summed across all local devices; {} if unavailable."""
-  try:
-    import jax  # pylint: disable=import-outside-toplevel
-
-    devs = jax.local_devices()
-    in_use = peak = limit = 0
-    for d in devs:
-      ms = d.memory_stats() or {}
-      in_use += ms.get("bytes_in_use", 0)
-      peak += ms.get("peak_bytes_in_use", 0)
-      limit += ms.get("bytes_limit", 0)
-    return {"in_use": in_use, "peak": peak, "limit": limit, "ndev": len(devs)}
-  except Exception:  # pylint: disable=broad-except
-    return {}
-
-
-def _kv_cache_usage(llm: Any) -> "float | None":
-  """Best-effort vLLM GPU KV-cache usage fraction (0..1); None if unavailable.
-
-  vLLM API for this differs across versions, so the probe is fully guarded and
-  only reads metrics (no mutating calls). vLLM also logs KV usage itself at INFO,
-  which is the fallback if this returns None.
-  """
-  try:
-    engine = getattr(llm, "llm_engine", None)
-    get_metrics = getattr(engine, "get_metrics", None)
-    if not callable(get_metrics):
-      return None
-    for m in get_metrics():
-      name = getattr(m, "name", "")
-      if "kv_cache_usage" in name or "gpu_cache_usage" in name:
-        return float(getattr(m, "value"))
-    return None
-  except Exception:  # pylint: disable=broad-except
-    return None
-
-
-def _mem_line(llm: Any) -> str:
-  """One-line memory snapshot for logging."""
-  hbm = _hbm_stats()
-  return (
-      f"host_rss={_host_rss_bytes()} "
-      f"hbm_in_use={hbm.get('in_use', -1)} hbm_peak={hbm.get('peak', -1)} "
-      f"hbm_limit={hbm.get('limit', -1)} ndev={hbm.get('ndev', -1)} "
-      f"kv_usage={_kv_cache_usage(llm)}"
-  )
-
-
 class _ChatBatchQueue:
-  
-  def __init__(self, llm: Any, max_wait_s: float, max_batch: int, max_pending: int):
+  """Collect chat requests into short, bounded vLLM generation batches."""
+
+  def __init__(self, llm: Any, max_batch: int):
     self._llm = llm
-    self._max_wait_s = max_wait_s
     self._max_batch = max_batch
-    self._max_pending = max_pending
     self._pending: list[tuple[Any, Any, "asyncio.Future"]] = []
     self._timer: "asyncio.TimerHandle | None" = None
 
   async def submit(self, prompt: Any, sampling_params: Any) -> Any:
     """Queue one rendered prompt and await its vLLM RequestOutput."""
-    if len(self._pending) >= self._max_pending:
-      raise _ChatQueueFullError(f"Chat request queue is full ({self._max_pending} pending requests).")
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     item = (prompt, sampling_params, future)
@@ -199,7 +131,7 @@ class _ChatBatchQueue:
       self._timer = None
       self._flush()
     elif self._timer is None:
-      self._timer = loop.call_later(self._max_wait_s, self._flush)
+      self._timer = loop.call_later(_CHAT_BATCH_WAIT_S, self._flush)
     try:
       return await future
     except asyncio.CancelledError:
@@ -211,6 +143,7 @@ class _ChatBatchQueue:
       raise
 
   def _flush(self) -> None:
+    """Submit the pending batch and resolve each request future."""
     self._timer = None
     batch, self._pending = self._pending, []
     if not batch:
@@ -238,14 +171,9 @@ class _ChatBatchQueue:
         future.set_result(output)
 
 
-class _ChatQueueFullError(RuntimeError):
-  """Raised when chat admission control rejects an excess request."""
-
-
 def _build_app(
     llm: Any,
-    chat_batch_wait_s: float = 0.02,
-    chat_batch_max_size: int = 64,
+    enable_chat_api: bool = False,
     request_concurrency: int = 16,
 ) -> Any:
   """Return a FastAPI app that wraps an in-process vLLM LLM instance."""
@@ -255,21 +183,6 @@ def _build_app(
   globals()["fastapi"] = fastapi
 
   app = fastapi.FastAPI()
-  app.state.request_count = 0
-  app.state.use_harmony = _is_harmony_model(llm)
-  app.state.harmony_stop_token_ids = _get_harmony_stop_token_ids() if app.state.use_harmony else []
-  configured_max_model_len = getattr(getattr(llm, "model_config", None), "max_model_len", None)
-  app.state.max_model_len = (
-      configured_max_model_len
-      if isinstance(configured_max_model_len, int) and configured_max_model_len > 0
-      else None
-  )
-  app.state.chat_batch_queue = _ChatBatchQueue(
-      llm,
-      max_wait_s=chat_batch_wait_s,
-      max_batch=chat_batch_max_size,
-      max_pending=request_concurrency,
-  )
 
   @app.get("/health")
   def health():
@@ -379,6 +292,18 @@ def _build_app(
         },
     }
 
+  if not enable_chat_api:
+    return app
+
+  app.state.request_count = 0
+  app.state.use_harmony = _is_harmony_model(llm)
+  app.state.harmony_stop_token_ids = _get_harmony_stop_token_ids() if app.state.use_harmony else []
+  configured_max_model_len = getattr(getattr(llm, "model_config", None), "max_model_len", None)
+  app.state.max_model_len = (
+      configured_max_model_len if isinstance(configured_max_model_len, int) and configured_max_model_len > 0 else None
+  )
+  app.state.chat_batch_queue = _ChatBatchQueue(llm, max_batch=request_concurrency)
+
   @app.post("/v1/chat/completions")
   async def chat_completions(request: fastapi.Request):  # pylint: disable=unused-variable
     """OpenAI-compatible chat completions endpoint.
@@ -442,9 +367,7 @@ def _build_app(
             isinstance(token_id, int) for token_id in requested_stop_token_ids
         ):
           raise ValueError("stop_token_ids must be an integer or a list of integers.")
-        harmony_stop_token_ids = list(
-            dict.fromkeys([*requested_stop_token_ids, *app.state.harmony_stop_token_ids])
-        )
+        harmony_stop_token_ids = list(dict.fromkeys([*requested_stop_token_ids, *app.state.harmony_stop_token_ids]))
         if harmony_stop_token_ids:
           sp_kwargs["stop_token_ids"] = harmony_stop_token_ids
       sampling_params = SamplingParams(**sp_kwargs)
@@ -453,9 +376,7 @@ def _build_app(
 
     try:
       output = await app.state.chat_batch_queue.submit(prompt, sampling_params)
-    except _ChatQueueFullError as exc:
-      raise fastapi.HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "1"}) from exc
-    except BaseException as exc: 
+    except BaseException as exc:
       logger.exception("chat_completions generate failed [%s]: %s", type(exc).__name__, exc)
       if isinstance(exc, Exception):
         raise fastapi.HTTPException(status_code=500, detail=str(exc)) from exc
@@ -480,17 +401,15 @@ def _build_app(
           reasoning,
           final_content,
       )
-      
+
     app.state.request_count += 1
-    if app.state.request_count % 100 == 0 or gen.finish_reason == "length":
-      logger.info(
-          "req=%d prompt_tok=%d completion_tok=%d finish=%s %s",
-          app.state.request_count,
-          prompt_tokens,
-          completion_tokens,
-          gen.finish_reason,
-          _mem_line(llm),
-      )
+    log_request_diagnostics(
+        llm,
+        app.state.request_count,
+        prompt_tokens,
+        completion_tokens,
+        gen.finish_reason,
+    )
 
     message: dict[str, Any] = {"role": "assistant", "content": final_content}
     if include_reasoning and reasoning is not None:
@@ -542,12 +461,9 @@ class VllmServerManager:
     max_num_seqs: Max concurrent sequences (None = vLLM default).
     startup_timeout: Seconds to wait for /health to return healthy.
     hbm_memory_utilization: Fraction of HBM reserved for KV cache.
-    chat_batch_wait_s: Max seconds /v1/chat/completions buffers a request
-      before flushing whatever has accumulated (see _ChatBatchQueue).
-    chat_batch_max_size: Max requests /v1/chat/completions batches into one
-      llm.generate() call before flushing early.
-    concurrency: Maximum accepted in-flight chat requests. None selects an
-      automatic value from CPU and accelerator counts and server limits.
+    enable_chat_api: Whether to expose /v1/chat/completions.
+    concurrency: Maximum chat request concurrency. None selects an automatic
+      value from CPU, accelerator count, and max_num_seqs.
     env: Optional environment-variable overrides.
     additional_vllm_kwargs: Extra kwargs merged into the vLLM LLM() constructor.
   """
@@ -568,8 +484,7 @@ class VllmServerManager:
       max_num_seqs: int | None = None,
       startup_timeout: int = 600,
       hbm_memory_utilization: float = 0.3,
-      chat_batch_wait_s: float = 0.02,
-      chat_batch_max_size: int = 64,
+      enable_chat_api: bool = False,
       concurrency: int | None = None,
       env: dict[str, str] | None = None,
       additional_vllm_kwargs: dict | None = None,
@@ -595,8 +510,7 @@ class VllmServerManager:
     self.max_num_seqs = max_num_seqs
     self.startup_timeout = startup_timeout
     self.hbm_memory_utilization = hbm_memory_utilization
-    self.chat_batch_wait_s = chat_batch_wait_s
-    self.chat_batch_max_size = chat_batch_max_size
+    self.enable_chat_api = enable_chat_api
     if concurrency is not None and concurrency <= 0:
       raise ValueError("concurrency must be positive when specified.")
     self._requested_concurrency = concurrency
@@ -607,8 +521,7 @@ class VllmServerManager:
     self._llm: Any | None = None
     self._uvicorn_server: Any | None = None
     self._server_thread: threading.Thread | None = None
-    self._mem_monitor_thread: threading.Thread | None = None
-    self._mem_monitor_stop = threading.Event()
+    self._memory_monitor: MemoryMonitor | None = None
 
   @property
   def base_url(self) -> str:
@@ -627,10 +540,7 @@ class VllmServerManager:
       return self._requested_concurrency
     limits = [
         max(1, cpu_count),
-        # Four queued sequences per accelerator is a conservative starting
-        # point for TPU decode; max_num_seqs/chat batch caps still take priority.
         max(1, accelerator_count * _AUTO_REQUESTS_PER_ACCELERATOR),
-        max(1, self.chat_batch_max_size),
     ]
     if self.max_num_seqs is not None:
       limits.append(max(1, self.max_num_seqs))
@@ -706,42 +616,30 @@ class VllmServerManager:
 
     import jax as _jax  # pylint: disable=import-outside-toplevel
 
-    detected_accelerators = max(1, _jax.device_count())
-    active_accelerators = min(
-        detected_accelerators,
-        max(1, self.tensor_parallel_size * self.data_parallel_size),
-    )
-    self._concurrency = self._resolve_concurrency(
-        cpu_count=os.cpu_count() or 1,
-        accelerator_count=active_accelerators,
-    )
-    logger.info(
-        "Request concurrency=%d (%s; cpu=%d active_accelerators=%d detected_accelerators=%d "
-        "max_num_seqs=%s chat_batch_max_size=%d)",
-        self._concurrency,
-        "explicit" if self._requested_concurrency is not None else "auto",
-        os.cpu_count() or 1,
-        active_accelerators,
-        detected_accelerators,
-        self.max_num_seqs,
-        self.chat_batch_max_size,
-    )
+    if self.enable_chat_api:
+      detected_accelerators = max(1, _jax.device_count())
+      active_accelerators = min(
+          detected_accelerators,
+          max(1, self.tensor_parallel_size * self.data_parallel_size),
+      )
+      self._concurrency = self._resolve_concurrency(
+          cpu_count=os.cpu_count() or 1,
+          accelerator_count=active_accelerators,
+      )
+      logger.info("Chat request concurrency=%d", self._concurrency)
 
     logger.info("Rank %d: vLLM LLM ready.", _jax.process_index())
 
-    # Time-based memory monitor (all ranks) catches OOM/leak trajectory even when
-    # requests stall or the process is about to be OOM-killed. Off unless
-    # EVAL_MEM_MONITOR_SEC is set to a positive interval.
-    self._start_mem_monitor(_jax.process_index())
+    self._memory_monitor = MemoryMonitor(self._llm, _jax.process_index())
+    self._memory_monitor.start()
 
     if _jax.process_index() == 0:
       import uvicorn  # pylint: disable=import-outside-toplevel
 
       app = _build_app(
           self._llm,
-          chat_batch_wait_s=self.chat_batch_wait_s,
-          chat_batch_max_size=self.chat_batch_max_size,
-          request_concurrency=self.concurrency,
+          enable_chat_api=self.enable_chat_api,
+          request_concurrency=self.concurrency if self.enable_chat_api else 1,
       )
       config = uvicorn.Config(
           app,
@@ -758,28 +656,6 @@ class VllmServerManager:
       )
       self._server_thread.start()
       self._wait_until_healthy()
-
-  def _start_mem_monitor(self, rank: int) -> None:
-    """Start a daemon thread logging memory every EVAL_MEM_MONITOR_SEC seconds.
-
-    No-op unless the env var is set to a positive value. Logs host RSS, HBM, and
-    vLLM KV usage on a fixed interval so a leak/OOM trajectory is captured even
-    if no request completes (stall) or the process is OOM-killed mid-request.
-    """
-    try:
-      interval = float(os.environ.get("EVAL_MEM_MONITOR_SEC", "0") or 0)
-    except ValueError:
-      interval = 0.0
-    if interval <= 0:
-      return
-
-    def _loop() -> None:
-      while not self._mem_monitor_stop.wait(interval):
-        logger.info("MEM_MONITOR rank=%d %s", rank, _mem_line(self._llm))
-
-    self._mem_monitor_thread = threading.Thread(target=_loop, daemon=True, name="mem-monitor")
-    self._mem_monitor_thread.start()
-    logger.info("Memory monitor started (rank=%d, every %.0fs).", rank, interval)
 
   def _wait_until_healthy(self) -> None:
     """Wait until the HTTP server returns 200 OK on /health."""
@@ -800,10 +676,9 @@ class VllmServerManager:
 
   def stop(self) -> None:
     """Stop the HTTP server and release the LLM."""
-    self._mem_monitor_stop.set()
-    if self._mem_monitor_thread is not None:
-      self._mem_monitor_thread.join(timeout=5)
-      self._mem_monitor_thread = None
+    if self._memory_monitor is not None:
+      self._memory_monitor.stop()
+      self._memory_monitor = None
     if self._uvicorn_server is not None:
       logger.info("Stopping vLLM HTTP server.")
       self._uvicorn_server.should_exit = True

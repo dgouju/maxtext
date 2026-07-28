@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""GSM8K simple-evals task."""
+
 from __future__ import annotations
 
 import random
@@ -23,6 +25,9 @@ from maxtext.eval.third_party.simple_evals import common
 from maxtext.eval.third_party.simple_evals.common import HTML_JINJA
 from maxtext.eval.third_party.simple_evals.mgsm_eval import score_mgsm
 from maxtext.eval.third_party.simple_evals.types import Eval, EvalResult, SamplerBase, SingleEvalResult
+
+# SamplerBase intentionally preserves the vendored simple-evals API.
+# pylint: disable=protected-access
 
 _DATASET_REPO_ID = "openai/gsm8k"
 _TEST_PARQUET_FILENAME = "main/test-00000-of-00001.parquet"
@@ -83,22 +88,20 @@ class GSM8KEval(Eval):
 
   def __call__(self, sampler: SamplerBase) -> EvalResult:
     def fn(row: dict):
-      prompt_messages = [
-          sampler._pack_message(content=QUERY_TEMPLATE.format(question=row["question"]), role="user")
-      ]
+      prompt_messages = [sampler._pack_message(content=QUERY_TEMPLATE.format(question=row["question"]), role="user")]
       sampler_response = sampler(prompt_messages)
       response_text = sampler_response.response_text
       actual_queried_prompt_messages = sampler_response.actual_queried_message_list
-      extracted_answer = extract_answer(response_text)
+      extracted_answer = extract_answer(response_text) if common.request_succeeded(sampler_response) else None
       score = score_mgsm(row["target"], extracted_answer or "")
       html = common.jinja_env.from_string(HTML_JINJA).render(
           prompt_messages=actual_queried_prompt_messages,
-          next_message=dict(content=response_text, role="assistant"),
+          next_message={"content": response_text, "role": "assistant"},
           score=score,
           correct_answer=row["target"],
           extracted_answer=extracted_answer or None,
       )
-      convo = actual_queried_prompt_messages + [dict(content=response_text, role="assistant")]
+      convo = actual_queried_prompt_messages + [{"content": response_text, "role": "assistant"}]
       return SingleEvalResult(
           html=html,
           score=score,
