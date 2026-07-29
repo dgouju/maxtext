@@ -676,7 +676,7 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
       custom_metadata=None,
   ):
     """Saves model, optimizer and the Grain input pipeline state."""
-    if self._checkpointer is None:
+    if not getattr(self, "directory", None) and not getattr(self, "_directory", None):
       return False
 
     # Standard Tunix Logic for Model/Optimizer.
@@ -729,7 +729,7 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
     Returns:
       (restored step, custom_metadata dict). Step is 0 if no checkpoint exists.
     """
-    if self._checkpointer is None:
+    if not getattr(self, "directory", None) and not getattr(self, "_directory", None):
       return 0, {}
 
     target_model = getattr(model, "student_model", model)
@@ -748,7 +748,7 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
 
   def restore_iterator(self):
     """Restores the iterator using MaxText's logic."""
-    if self._checkpointer is None or self._iterator is None:
+    if (not getattr(self, "directory", None) and not getattr(self, "_directory", None)) or self._iterator is None:
       return None
 
     step = self.latest_step()
@@ -761,7 +761,7 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
       data_iter = self._iterator
       local_iter = data_iter.local_iterator if hasattr(data_iter, "local_iterator") else data_iter
 
-      self._checkpointer.load_checkpointables(
+      self._restore_checkpointables(
           step,
           {"iter": grain_utility.GrainCheckpointable(restore_args=grain_utility.GrainCheckpointRestore(item=local_iter))},
       )
@@ -774,5 +774,5 @@ class MaxTextCheckpointManager(tunix_checkpoint_manager.CheckpointManager):
 
   def wait_until_finished(self):
     """Blocks until all outstanding checkpoint operations are complete."""
-    if self._checkpointer is not None:
-      self._checkpointer.wait()
+    if hasattr(super(), "wait_until_finished"):
+      super().wait_until_finished()

@@ -3742,6 +3742,7 @@ class RLConfig(
     Engram,
     RematAndOffload,
     Attention,
+    Llama4Attention,
     LayoutAndSharding,
     InferenceLayout,
     InferenceGeneral,
