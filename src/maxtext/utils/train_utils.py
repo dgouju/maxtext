@@ -263,7 +263,7 @@ def setup_train_loop(config, recorder, devices=None, restore_checkpoint=True, ch
 
   with maybe_record_goodput(recorder, GoodputEvent.TRAINING_PREPARATION):
     elastic_manager = elastic_utils.elastic_manager
-    if elastic_manager and elastic_manager.new_slice_event.is_set():
+    if elastic_manager and elastic_utils.is_scale_up_event(config):
       raise elastic_utils.manager.ScaleUpSignalError("Scale up during setup (before data iterator)")
     data_iterator, eval_data_iterator = create_data_iterator(config, mesh)
     rampup_manager = create_rampup_manager(config, checkpoint_manager)
@@ -310,7 +310,7 @@ def setup_train_loop(config, recorder, devices=None, restore_checkpoint=True, ch
     # Create data_loader AFTER reordering wrapper is applied
     data_loader = create_dataloader(config, mesh, data_iterator, recorder, rampup_manager)
 
-    if elastic_manager and elastic_manager.new_slice_event.is_set():
+    if elastic_manager and elastic_utils.is_scale_up_event(config):
       raise elastic_utils.manager.ScaleUpSignalError("Scale up during setup (before state restore)")
     state, _, state_mesh_shardings, data_iterator, _ = maxtext_utils.setup_training_state(
         data_iterator, config, mesh, checkpoint_manager if restore_checkpoint else None, init_state_fn

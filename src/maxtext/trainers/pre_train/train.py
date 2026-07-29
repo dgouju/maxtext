@@ -1201,7 +1201,7 @@ def recover(
           "ScaleUpSignalError caught during recovery: %s. Retrying recovery.", e
       )
       if elastic_manager is not None:
-        elastic_manager.new_slice_event.clear()
+        pass
 
 
 def scale_up(
@@ -1223,7 +1223,6 @@ def scale_up(
   elastic_manager.active_slice_indices = elastic.get_active_slice_indices(
       elastic_manager.slice_to_devices
   )
-  elastic_manager.new_slice_event.clear()
 
   recover(
       jax_device_state,
@@ -1302,7 +1301,7 @@ def train_loop(config, recorder, state=None):
       init_done = init_complete_event.wait(timeout=1)
 
       if elastic_manager and elastic_utils.elastic_enabled(config):
-        new_slice = elastic_manager.new_slice_event.is_set()
+        new_slice = elastic_utils.is_scale_up_event(config)
 
         if new_slice and not init_done:
           max_logging.log(
@@ -1493,7 +1492,7 @@ def train_loop(config, recorder, state=None):
           # Scale-up check at the end of the step (only if elastic)
           if (
               config.elastic_enabled
-              and elastic_manager.new_slice_event.is_set()
+              and elastic_utils.is_scale_up_event(config)
           ):
             scale_up(
                 jax_device_state,
