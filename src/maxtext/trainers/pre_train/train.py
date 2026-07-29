@@ -1250,7 +1250,7 @@ def train_loop(config, recorder, state=None):
     all_devices = jax.devices()
     slice_to_devices = elastic.get_slice_to_devices(all_devices)
     elastic.wait_for_slices(
-        slice_count=min_slices,
+        slice_count=config.num_slices,
         slice_to_devices=slice_to_devices,
         timeout=config.elastic_timeout_seconds,
     )
@@ -1274,6 +1274,89 @@ def train_loop(config, recorder, state=None):
     monitor_thread.start()
     elastic_utils.elastic_manager = elastic_manager
     devices = elastic_utils.live_devices(config)
+
+    # Recalculate num_target_devices and batch sizes for the active startup topology
+    new_num_devices = len(devices)
+    object.__setattr__(config, "num_target_devices", new_num_devices)
+
+    def calc_gbs(
+        per_device_batch_size, expansion_factor, num_devices, grad_accum_steps
+    ):
+      if per_device_batch_size < 1.0:
+        mbs_load = num_devices * (
+            expansion_factor if expansion_factor > 0 else 1
+        )
+      else:
+        mbs_load = int(
+            num_devices
+            * per_device_batch_size
+            * (expansion_factor if expansion_factor > 0 else 1)
+        )
+      mbs_train = int(num_devices * per_device_batch_size)
+      gbs_load = int(mbs_load * grad_accum_steps)
+      gbs_train = int(mbs_train * grad_accum_steps)
+      return gbs_load, gbs_train, mbs_train
+
+    # Update train batch sizes
+    gbs_load, gbs_train, mbs_train = calc_gbs(
+        config.per_device_batch_size,
+        config.expansion_factor_real_data,
+        new_num_devices,
+        config.gradient_accumulation_steps,
+    )
+    def _update_cfg(cfg, k, v):
+      object.__setattr__(cfg, k, v)
+      if hasattr(cfg, "_flat_config"):
+        cfg._flat_config[k] = v
+      if hasattr(cfg, "_pydantic_config"):
+        setattr(cfg._pydantic_config, k, v)
+    _update_cfg(config, "global_batch_size_to_load", gbs_load)
+    _update_cfg(config, "global_batch_size_to_train_on", gbs_train)
+    _update_cfg(config, "micro_batch_size_to_train_on", mbs_train)
+
+    # Update eval batch sizes
+    gbs_load_eval, gbs_eval, mbs_eval = calc_gbs(
+        config.eval_per_device_batch_size,
+        config.expansion_factor_real_data,
+        new_num_devices,
+        1,
+    )
+    _update_cfg(config, "global_batch_size_to_load_eval", gbs_load_eval)
+    _update_cfg(config, "global_batch_size_to_eval_on", gbs_eval)
+    _update_cfg(config, "micro_batch_size_to_eval_on", mbs_eval)
+
+    if config.enable_rampup_batch_size:
+      gbs_load_start = calc_gbs(
+          config.per_device_batch_size_start,
+          config.expansion_factor_real_data,
+          new_num_devices,
+          config.gradient_accumulation_steps,
+      )[0]
+      gbs_load_inc, _, _ = calc_gbs(
+          config.per_device_batch_size_increment,
+          config.expansion_factor_real_data,
+          new_num_devices,
+          config.gradient_accumulation_steps,
+      )
+      object.__setattr__(
+          config, "global_batch_size_to_load_start", gbs_load_start
+      )
+      object.__setattr__(
+          config, "global_batch_size_to_load_increment", gbs_load_inc
+      )
+
+      diff_batch_size = gbs_load - gbs_load_start
+      if gbs_load_inc > 0:
+        num_increments = diff_batch_size // gbs_load_inc
+        if num_increments > 0:
+          rampup_samples_per_increment = (
+              config.global_rampup_samples / num_increments
+          )
+          object.__setattr__(
+              config,
+              "rampup_samples_per_increment_to_load",
+              rampup_samples_per_increment,
+          )
   else:
     _logger.info("[*] Standard Non-Elastic Training.")
 
