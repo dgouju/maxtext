@@ -145,9 +145,7 @@ def main():
       print(f"Error loading baseline {args.baseline}: {e}")
 
   # Initialize with existing baseline data, filtering out old legacy keys without flavor separator '::'
-  new_baseline_data = {
-      k: v for k, v in baseline_data.items() if "::" in k and isinstance(v, (int, float))
-  }
+  new_baseline_data = {k: v for k, v in baseline_data.items() if "::" in k and isinstance(v, (int, float))}
   has_regression = False
   has_errors = False
 

@@ -70,9 +70,7 @@ class ProcessTestResultsTest(unittest.TestCase):
         new_baseline,
     )
     self.assertEqual(
-        new_baseline[
-            "gpu-unit::tests.unit.qk_clip_test.QKClipMLATest.test_mla_dot_product_integration"
-        ],
+        new_baseline["gpu-unit::tests.unit.qk_clip_test.QKClipMLATest.test_mla_dot_product_integration"],
         15.99,
     )
 
