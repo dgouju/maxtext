@@ -415,7 +415,8 @@ jobs:
       actions: 'read'
     with:
       failed_run_id: '${{ github.run_id }}'
-    secrets: inherit
+    secrets:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
   track_performance:
     name: Track Test Duration
