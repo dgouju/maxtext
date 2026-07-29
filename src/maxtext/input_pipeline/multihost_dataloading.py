@@ -52,7 +52,7 @@ def _build_global_shape_and_sharding(
 ) -> tuple[tuple[int, ...], NamedSharding]:
   sharding = NamedSharding(global_mesh, PartitionSpec(global_mesh.axis_names))
 
-  process_count = len(set((d.slice_index, d.logical_task_id) for d in global_mesh.devices))
+  process_count = len(set((d.slice_index, d.logical_task_id) for d in global_mesh.devices.flat))
   global_shape = (process_count * local_shape[0],) + local_shape[1:]
 
   return global_shape, sharding
