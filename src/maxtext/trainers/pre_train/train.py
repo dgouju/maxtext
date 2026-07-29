@@ -1241,9 +1241,8 @@ def train_loop(config, recorder, state=None):
   monitor_thread = None
 
   if config.elastic_enabled:
-    min_slices = config.elastic_min_slice_count
-    if min_slices == -1:
-      min_slices = config.num_slices
+    # Hardcoded for this testing branch: wait for all slices to be available initially.
+    min_slices = config.num_slices
 
     _logger.info(
         "[*] Waiting for %d slices to be active at startup...", min_slices
