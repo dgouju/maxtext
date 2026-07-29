@@ -516,7 +516,7 @@ class Gemma4ScannableBlock(nnx.Module):
 
     False when the caller applies block-level remat instead
     (``apply_internal_remat=False``) or when remat is disabled
-    (``remat_policy == "none"``). Note that ``remat_policy_fn`` 
+    (``remat_policy == "none"``). Note that ``remat_policy_fn``
     is ``None`` for both ``"none"`` and ``"full"``, so it
     cannot distinguish "no remat" from "full remat" on its own.
     """
@@ -562,11 +562,11 @@ class Gemma4ScannableBlock(nnx.Module):
     intermediate_xs = jax.tree.map(lambda x: x[None], intermediate_g)
 
     def run_global_layer(carry, intermediate_slice):
-      current_y, current_other = carry
-      layer = nnx.merge(graphdef_g, intermediate_slice, current_other)
-      new_y = self._run_layer(layer, current_y, layer_kwargs)[0]
+      hidden_states, other = carry
+      layer = nnx.merge(graphdef_g, intermediate_slice, other)
+      new_hidden_states = self._run_layer(layer, hidden_states, layer_kwargs)[0]
       _, new_intermediate, new_other = nnx.split(layer, nnx.Intermediate, ...)
-      return (new_y, new_other), new_intermediate
+      return (new_hidden_states, new_other), new_intermediate
 
     # Offloaded (pinned-host) residuals can't cross the trip-count-one boundary,
     # so save would-be-offloaded tensors on device for the global layer instead;
