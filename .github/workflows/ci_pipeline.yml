@@ -54,7 +54,7 @@ jobs:
       run_tests: ${{ steps.check.outputs.run_tests }}
       run_notebooks: ${{ steps.check.outputs.run_notebooks }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ inputs.maxtext_sha || github.sha }}
@@ -418,7 +418,7 @@ jobs:
     secrets: inherit
 
   track_performance:
-    name: Track Test Duration
+    name: Track Test Performance
     needs: [tpu-tests, gpu-tests, cpu-tests]
     if: ${{ always() && (needs.cpu-tests.result == 'success' || needs.gpu-tests.result == 'success' || needs.tpu-tests.result == 'success') }}
     uses: ./.github/workflows/track_performance.yml
@@ -426,4 +426,5 @@ jobs:
       contents: write
       id-token: write
       pull-requests: write
+    secrets: inherit
 
