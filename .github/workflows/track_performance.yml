@@ -72,7 +72,7 @@ jobs:
           git worktree remove gh-pages
 
       - name: Track Test Durations (Macro-level Dashboard)
-        uses: benchmark-action/github-action-benchmark@1e3895e69e46a36f525c3ec0b02130e9d6d025b5 # v1.13.0
+        uses: benchmark-action/github-action-benchmark@3d3bca03e83647895ef4f911fa57de3c7a391aaf # v1.13.0
         with:
           name: MaxText Test Execution Times
           tool: 'customSmallerIsBetter'
