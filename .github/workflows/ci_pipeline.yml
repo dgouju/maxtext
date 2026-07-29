@@ -418,7 +418,7 @@ jobs:
     secrets: inherit
 
   track_performance:
-    name: Track Test Performance
+    name: Track Test Duration
     needs: [tpu-tests, gpu-tests, cpu-tests]
     if: ${{ always() && (needs.cpu-tests.result == 'success' || needs.gpu-tests.result == 'success' || needs.tpu-tests.result == 'success') }}
     uses: ./.github/workflows/track_performance.yml
