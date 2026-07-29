@@ -744,6 +744,26 @@ class _StatefulGemma4DecoderLayer(nnx.Module):
     return output, kv_cache + self.increment
 
 
+class _SowingGemma4DecoderLayer(nnx.Module):
+  """Stand-in whose global layer sows an accumulating Intermediate, like MoE moe_lb_loss."""
+
+  def __init__(self, *, attention_type, **unused_kwargs):
+    self.is_global = attention_type == AttentionType.GLOBAL
+    # A trivial variable so the local layers have state for apply_scanned_layers to
+    # scan over (a bare module has nothing to scan and lax.scan can't infer length).
+    self.marker = nnx.Intermediate(jnp.zeros(()))
+
+  def __call__(self, inputs, *unused_args, kv_cache=None, **unused_kwargs):
+    output = inputs + 1
+    if self.is_global:
+      # nnx.sow appends into a tuple by default, so it grows across calls -- the
+      # MoE moe_lb_loss pattern that must not enter the global length-1 scan carry.
+      self.sow(nnx.Intermediate, "moe_lb_loss", jnp.sum(output))
+    if kv_cache is None:
+      return output
+    return output, kv_cache
+
+
 class TestGemma4ScannableBlock(unittest.TestCase):
   """Tests Gemma4's nested local/global decoder block behavior."""
 
@@ -779,6 +799,27 @@ class TestGemma4ScannableBlock(unittest.TestCase):
     self.assertIsNone(updated_kvs)
     np.testing.assert_array_equal(block.local_layers.call_count.value, jnp.ones(5, dtype=jnp.int32))
     np.testing.assert_array_equal(block.global_layer.call_count.value, 1)
+
+  def test_global_layer_sown_intermediate_accumulates_across_calls(self):
+    """A global layer that sows an accumulating Intermediate (e.g. MoE moe_lb_loss)
+    must not break the length-1 scan carry, even when the Intermediate already
+    exists from a previous call and the sow grows its tuple (1 -> 2 elements)."""
+    call_kwargs = dict(
+        decoder_segment_ids=None,
+        decoder_positions=None,
+        deterministic=True,
+        model_mode=MODEL_MODE_AUTOREGRESSIVE,
+    )
+    with mock.patch.object(gemma4, "Gemma4DecoderLayer", _SowingGemma4DecoderLayer):
+      block = self._make_block()
+      # First call creates moe_lb_loss on the global layer (1-tuple).
+      block(jnp.zeros((1, 1, 1)), **call_kwargs)
+      # Second call: moe_lb_loss already exists and the sow appends -> 2-tuple.
+      # Carrying it in the scan would change the carry pytree; the type-based
+      # split keeps Intermediates on the ys path instead.
+      block(jnp.zeros((1, 1, 1)), **call_kwargs)
+
+    self.assertEqual(len(block.global_layer.moe_lb_loss.value), 2)
 
   def test_restores_local_state_and_preserves_kv_order(self):
     attention_metadata = object()

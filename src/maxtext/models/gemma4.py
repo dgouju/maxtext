@@ -548,13 +548,25 @@ class Gemma4ScannableBlock(nnx.Module):
     and OOMs.
     """
     cfg = self.config
-    graphdef_g, state_g = nnx.split(self.global_layer)
+    # Split the state into Intermediates and everything else. Non-Intermediate
+    # state (the large persistent weights/residuals) is carried through the scan
+    # so it stays off the offload-bitcast-prone ys path. Intermediates instead go
+    # in as scan xs and come out as ys: a sow can create or grow an Intermediate
+    # during the call (e.g. MoE moe_lb_loss accumulates into a tuple), which would
+    # break a carry's fixed pytree, and closing them over would mutate state from
+    # the wrong trace level (nnx.merge aliases the variables). Routing through
+    # xs/ys sidesteps both -- xs/ys have no matching-structure constraint and xs is
+    # trace-local. For a dense layer that sows nothing (31b) the Intermediate
+    # partition is empty and this is a no-op.
+    graphdef_g, intermediate_g, other_g = nnx.split(self.global_layer, nnx.Intermediate, ...)
+    intermediate_xs = jax.tree.map(lambda x: x[None], intermediate_g)
 
-    def run_global_layer(carry, _):
-      current_y, current_state = carry
-      layer = nnx.merge(graphdef_g, current_state)
+    def run_global_layer(carry, intermediate_slice):
+      current_y, current_other = carry
+      layer = nnx.merge(graphdef_g, intermediate_slice, current_other)
       new_y = self._run_layer(layer, current_y, layer_kwargs)[0]
-      return (new_y, nnx.state(layer)), None
+      _, new_intermediate, new_other = nnx.split(layer, nnx.Intermediate, ...)
+      return (new_y, new_other), new_intermediate
 
     # Offloaded (pinned-host) residuals can't cross the trip-count-one boundary,
     # so save would-be-offloaded tensors on device for the global layer instead;
@@ -573,18 +585,22 @@ class Gemma4ScannableBlock(nnx.Module):
           prevent_cse=prevent_cse,
       )
 
-    # Carry state through the loop instead of returning a stacked [1, ...] scan
-    # result: slicing that result previously introduced a bitcast between device
-    # and pinned-host memory under offload remat.
+    # Carry the non-Intermediate state through the loop instead of returning it as
+    # a stacked [1, ...] result: slicing that result previously introduced a bitcast
+    # between device and pinned-host memory under offload remat. Only the (tiny)
+    # Intermediates ride the xs/ys path.
     with xla_metadata.set_xla_metadata(**{"skip-simplify-while-loops_trip-count-one": "true"}):
-      (y, global_state), _ = jax.lax.scan(
+      (y, final_other), stacked_intermediate = jax.lax.scan(
           run_global_layer,
-          (y, state_g),
-          xs=None,
+          (y, other_g),
+          intermediate_xs,
           length=1,
       )
 
-    nnx.update(self.global_layer, global_state)
+    # Squeeze the length-1 scan axis off the updated Intermediate state and write
+    # it back to the module along with the carried non-Intermediate state.
+    intermediate_state = jax.tree.map(lambda x: x[0], stacked_intermediate)
+    nnx.update(self.global_layer, final_other, intermediate_state)
     return y
 
   def _forward_with_external_kv_cache(self, y, kv_cache, layer_kwargs):
